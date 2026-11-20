@@ -1,4 +1,5 @@
 use crate::db::{self, ClipItem, NewClip};
+use crate::popup::{parse_hotkey_string, toggle_popup_window, HOTKEY_POPUP_ID};
 use crate::AppState;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -31,14 +32,15 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows_sys::Win32::UI::Shell::{
     ExtractIconExW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, GetClassNameW, GetForegroundWindow, GetIconInfo, GetMessageW, GetWindowTextW,
-    GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW, TranslateMessage,
-    HICON, HWND_MESSAGE, ICONINFO, WM_CLOSE, WM_DESTROY, WNDCLASSEXW,
+    EnumChildWindows, GetClassNameW, GetForegroundWindow, GetIconInfo, GetMessageW,
+    GetWindowTextW, GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW,
+    TranslateMessage, HICON, HWND_MESSAGE, ICONINFO, WM_CLOSE, WM_DESTROY, WNDCLASSEXW,
 };
 
 #[link(name = "kernel32")]
@@ -51,6 +53,8 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
 const CF_DIBV5: u32 = 17;
 const WM_CLIPBOARDUPDATE: u32 = 0x031D;
+const WM_HOTKEY: u32 = 0x0312;
+const WM_APP_RELOAD_HOTKEY: u32 = 0x8001;
 const WS_EX_TOOLWINDOW_FLAG: u32 = 0x0000_0080;
 const WS_EX_NOACTIVATE_FLAG: u32 = 0x0800_0000;
 const GMEM_MOVEABLE_FLAG: u32 = 0x0002;
@@ -105,6 +109,15 @@ pub struct ClipboardWatcherHandle {
 }
 
 impl ClipboardWatcherHandle {
+    pub fn reload_hotkey(&self) {
+        let raw = self.hwnd.load(Ordering::SeqCst);
+        if raw != 0 {
+            unsafe {
+                PostMessageW(raw as HWND, WM_APP_RELOAD_HOTKEY, 0, 0);
+            }
+        }
+    }
+
     pub fn stop(&self) {
         let raw = self.hwnd.load(Ordering::SeqCst);
         if raw != 0 {
@@ -255,7 +268,10 @@ fn wrap_cf_html(fragment: &str) -> String {
     let full = format!("{prefix}{fragment}{suffix}");
     let start_html = full.find("<html>").unwrap_or(105);
     let end_html = full.len();
-    let start_frag = full.find("<!--StartFragment-->").map(|i| i + 20).unwrap_or(start_html);
+    let start_frag = full
+        .find("<!--StartFragment-->")
+        .map(|i| i + 20)
+        .unwrap_or(start_html);
     let end_frag = full.find("<!--EndFragment-->").unwrap_or(end_html);
     format!(
         "Version:0.9\r\nStartHTML:{start_html:010}\r\nEndHTML:{end_html:010}\r\nStartFragment:{start_frag:010}\r\nEndFragment:{end_frag:010}\r\n<html><body>\r\n<!--StartFragment-->{fragment}<!--EndFragment-->\r\n</body></html>"
@@ -279,13 +295,12 @@ fn png_to_dib(png_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let row_bytes = (info.width as usize) * 4;
     let mut dib = Vec::with_capacity(40 + row_bytes * (info.height as usize));
 
-    // BITMAPINFOHEADER (40 bytes, bottom-up BGRA)
     dib.extend_from_slice(&40u32.to_le_bytes());
     dib.extend_from_slice(&w.to_le_bytes());
     dib.extend_from_slice(&h.to_le_bytes());
     dib.extend_from_slice(&1u16.to_le_bytes());
     dib.extend_from_slice(&32u16.to_le_bytes());
-    dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    dib.extend_from_slice(&0u32.to_le_bytes());
     dib.extend_from_slice(&((row_bytes * info.height as usize) as u32).to_le_bytes());
     dib.extend_from_slice(&0i32.to_le_bytes());
     dib.extend_from_slice(&0i32.to_le_bytes());
@@ -301,7 +316,8 @@ fn png_to_dib(png_bytes: &[u8]) -> Result<Vec<u8>, String> {
     };
 
     for y in (0..info.height as usize).rev() {
-        let row = &samples[y * (info.width as usize) * src_bpp..(y + 1) * (info.width as usize) * src_bpp];
+        let row = &samples
+            [y * (info.width as usize) * src_bpp..(y + 1) * (info.width as usize) * src_bpp];
         for x in 0..info.width as usize {
             let s = x * src_bpp;
             match info.color_type {
@@ -549,7 +565,9 @@ fn read_window_title(hwnd_raw: isize) -> Option<String> {
         let mut buf = [0u16; 512];
         let len = GetWindowTextW(hwnd_raw as HWND, buf.as_mut_ptr(), buf.len() as i32);
         if len > 0 {
-            let title = String::from_utf16_lossy(&buf[..len as usize]).trim().to_string();
+            let title = String::from_utf16_lossy(&buf[..len as usize])
+                .trim()
+                .to_string();
             if !title.is_empty() {
                 return Some(title);
             }
@@ -585,6 +603,18 @@ fn infer_site_from_browser_title(title: &str) -> Option<String> {
     if stripped.contains("chatgpt") {
         return Some("site:chatgpt.com".to_string());
     }
+    if stripped.contains("claude") {
+        return Some("site:claude.ai".to_string());
+    }
+    if stripped.contains("todoist") {
+        return Some("site:todoist.com".to_string());
+    }
+    if stripped.contains("discord") {
+        return Some("site:discord.com".to_string());
+    }
+    if stripped.contains("notion") {
+        return Some("site:notion.so".to_string());
+    }
     if stripped.contains("reddit") {
         return Some("site:reddit.com".to_string());
     }
@@ -608,7 +638,6 @@ fn extract_source_site(
 ) -> Option<String> {
     let is_browser = exe_name.map(is_browser_exe).unwrap_or(false);
 
-    // 1. HTML Format SourceURL header (browser DOM copies)
     if is_browser {
         if let Some(html) = raw_html {
             for line in html.lines().take(25) {
@@ -622,7 +651,6 @@ fn extract_source_site(
         }
     }
 
-    // 2. Copied URL / Link text itself (e.g. address bar or Copy Link Address)
     if let Some(text) = text_opt {
         let trimmed = text.trim();
         if is_link(trimmed) {
@@ -632,7 +660,6 @@ fn extract_source_site(
         }
     }
 
-    // 3. Browser tab window title fallback (e.g. plain-text copy inside input/textarea)
     if is_browser {
         if let Some(title) = read_window_title(fg_hwnd) {
             if let Some(site) = infer_site_from_browser_title(&title) {
@@ -1115,6 +1142,17 @@ fn read_raw_html_format(html_format_id: u32) -> Option<String> {
     }
 }
 
+fn has_meaningful_html_formatting(frag: &str) -> bool {
+    let lower = frag.to_ascii_lowercase();
+    let rich_tags = [
+        "<b>", "<b ", "<strong>", "<strong ", "<i>", "<i ", "<em>", "<em ", "<u>", "<u ",
+        "<a ", "<h1", "<h2", "<h3", "<h4", "<ul", "<ol", "<li", "<table", "<blockquote",
+        "<pre", "<code", "<img ", "font-weight: 700", "font-weight: bold", "font-weight:700",
+        "font-weight:bold",
+    ];
+    rich_tags.iter().any(|tag| lower.contains(tag))
+}
+
 fn is_hex_color(s: &str) -> bool {
     if let Some(hex) = s.strip_prefix('#') {
         return matches!(hex.len(), 3 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
@@ -1189,7 +1227,7 @@ fn looks_like_code(s: &str) -> bool {
     false
 }
 
-fn detect_text_clip_type(text: &str, has_html: bool) -> &'static str {
+fn detect_text_clip_type(text: &str, meaningful_html: bool) -> &'static str {
     let trimmed = text.trim();
     if is_hex_color(trimmed) || is_functional_color(trimmed) {
         return "color";
@@ -1203,7 +1241,7 @@ fn detect_text_clip_type(text: &str, has_html: bool) -> &'static str {
     if looks_like_code(trimmed) {
         return "code";
     }
-    if has_html {
+    if meaningful_html {
         return "rich_text";
     }
     "text"
@@ -1240,7 +1278,6 @@ fn process_payload(
         } => (*fg_hwnd, *owner_hwnd, raw_html.as_deref(), *created_at),
     };
 
-    // Resolve process info & check exclusions completely off the Win32 listener thread
     let source_proc = resolve_source_from_hwnds(fg_hwnd, owner_hwnd);
     if let Some((ref exe_name, _)) = source_proc {
         if let Ok(excluded) = state.excluded_apps_cache.read() {
@@ -1314,8 +1351,18 @@ fn process_payload(
                 .map(extract_cf_html_fragment)
                 .filter(|f| !f.is_empty());
 
+            let meaningful_html = html_frag
+                .as_deref()
+                .map(has_meaningful_html_formatting)
+                .unwrap_or(false);
+
             let text_bytes = text.as_ref().map(|s| s.len()).unwrap_or(0);
-            let html_bytes = html_frag.as_ref().map(|s| s.len()).unwrap_or(0);
+            let html_bytes = if meaningful_html {
+                html_frag.as_ref().map(|s| s.len()).unwrap_or(0)
+            } else {
+                0
+            };
+            let stored_html = if meaningful_html { html_frag } else { None };
             let total_size = text_bytes + html_bytes;
 
             if total_size == 0 || total_size > max_bytes {
@@ -1323,7 +1370,7 @@ fn process_payload(
             }
 
             let clip_type = match text.as_deref() {
-                Some(t) => detect_text_clip_type(t, html_frag.is_some()),
+                Some(t) => detect_text_clip_type(t, meaningful_html),
                 None => "rich_text",
             };
 
@@ -1347,7 +1394,7 @@ fn process_payload(
                     &NewClip {
                         clip_type,
                         text_content: text.as_deref(),
-                        html_content: html_frag.as_deref(),
+                        html_content: stored_html.as_deref(),
                         image_path: None,
                         content_size: total_size as i64,
                         source_app: source_app.as_deref(),
@@ -1438,7 +1485,6 @@ fn save_image_clip(
 }
 
 fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
-    // Ignore copies triggered programmatically by Klip itself
     if IGNORE_SELF_COPY.swap(false, Ordering::SeqCst) {
         return;
     }
@@ -1448,8 +1494,8 @@ fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
         return;
     }
 
-    // Grab lightweight window handles only; process/icon/domain work happens in worker thread
-    let (fg_hwnd, owner_hwnd) = unsafe { (GetForegroundWindow() as isize, GetClipboardOwner() as isize) };
+    let (fg_hwnd, owner_hwnd) =
+        unsafe { (GetForegroundWindow() as isize, GetClipboardOwner() as isize) };
     let created_at = db::now_unix_ms();
 
     let payload: Option<RawClipboardPayload> = {
@@ -1516,12 +1562,19 @@ fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
                 }
             }
         }
-    }; // _lock drops here -> CloseClipboard() immediately
+    };
 
     if let Some(p) = payload {
         if let Some(tx) = ctx.worker_tx.as_ref() {
             let _ = tx.send(p);
         }
+    }
+}
+
+unsafe fn register_popup_hotkey(hwnd: HWND, spec: &str) {
+    UnregisterHotKey(hwnd, HOTKEY_POPUP_ID);
+    if let Some((mods, vk)) = parse_hotkey_string(spec) {
+        let _ = RegisterHotKey(hwnd, HOTKEY_POPUP_ID, mods, vk);
     }
 }
 
@@ -1535,7 +1588,37 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             });
             0
         }
+        WM_HOTKEY => {
+            if wparam as i32 == HOTKEY_POPUP_ID {
+                let fg_hwnd = GetForegroundWindow() as isize;
+                LISTENER_CTX.with(|cell| {
+                    if let Some(ctx) = cell.borrow().as_ref() {
+                        let app_c = ctx.app.clone();
+                        let _ = ctx.app.run_on_main_thread(move || {
+                            toggle_popup_window(&app_c, fg_hwnd);
+                        });
+                    }
+                });
+            }
+            0
+        }
+        WM_APP_RELOAD_HOTKEY => {
+            LISTENER_CTX.with(|cell| {
+                if let Some(ctx) = cell.borrow().as_ref() {
+                    let state = ctx.app.state::<AppState>();
+                    let spec = state
+                        .conn
+                        .lock()
+                        .ok()
+                        .and_then(|conn| db::get_setting(&conn, "hotkey").ok().flatten())
+                        .unwrap_or_else(|| "Ctrl+Shift+Backquote".to_string());
+                    register_popup_hotkey(hwnd, &spec);
+                }
+            });
+            0
+        }
         WM_CLOSE => {
+            UnregisterHotKey(hwnd, HOTKEY_POPUP_ID);
             RemoveClipboardFormatListener(hwnd);
             DestroyWindow(hwnd);
             0
@@ -1551,7 +1634,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
-pub fn start_clipboard_listener(app: AppHandle) -> ClipboardWatcherHandle {
+pub fn start_clipboard_listener(app: AppHandle, initial_hotkey: String) -> ClipboardWatcherHandle {
     let hwnd_holder = Arc::new(AtomicIsize::new(0));
     let hwnd_for_thread = Arc::clone(&hwnd_holder);
 
@@ -1625,7 +1708,8 @@ pub fn start_clipboard_listener(app: AppHandle) -> ClipboardWatcherHandle {
                 return;
             }
 
-            // Strictly blocking GetMessageW loop (0.00% idle CPU)
+            register_popup_hotkey(hwnd, &initial_hotkey);
+
             let mut msg = zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
                 TranslateMessage(&msg);

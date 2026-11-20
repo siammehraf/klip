@@ -1,18 +1,20 @@
 mod clipboard;
 mod db;
+mod popup;
 
 use clipboard::{normalize_exe_name, write_clip_to_clipboard, ClipboardWatcherHandle};
 use db::{ClipItem, SettingEntry};
+use popup::paste_clip_to_previous_window;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winreg::RegKey;
@@ -39,6 +41,9 @@ pub struct AppState {
     pub pause_menu_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     pub allow_exit: AtomicBool,
     pub watcher: Mutex<Option<ClipboardWatcherHandle>>,
+    pub popup_prev_hwnd: AtomicIsize,
+    pub popup_keep_open: AtomicBool,
+    pub popup_opened_at_ms: AtomicI64,
 }
 
 #[derive(Serialize)]
@@ -53,6 +58,15 @@ pub struct Phase1Status {
     pub settings: Vec<SettingEntry>,
 }
 
+#[derive(Serialize)]
+pub struct PopupInitData {
+    pub theme: String,
+    pub font_family: String,
+    pub paste_mode: String,
+    pub paused: bool,
+    pub clips: Vec<ClipItem>,
+}
+
 fn select_tray_icon_bytes(theme: &str, paused: bool) -> &'static [u8] {
     match (theme, paused) {
         ("light", false) => ICON_TRAY_LIGHT,
@@ -62,7 +76,7 @@ fn select_tray_icon_bytes(theme: &str, paused: bool) -> &'static [u8] {
     }
 }
 
-fn select_window_icon_bytes(theme: &str) -> &'static [u8] {
+pub fn select_window_icon_bytes(theme: &str) -> &'static [u8] {
     if theme == "light" {
         ICON_WIN_LIGHT
     } else {
@@ -240,8 +254,8 @@ fn get_phase1_status(app: AppHandle, state: State<'_, AppState>) -> Result<Phase
     let theme = state
         .theme
         .lock()
-        .map_err(|_| "Theme lock poisoned".to_string())?
-        .clone();
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "dark".to_string());
 
     Ok(Phase1Status {
         version: app.package_info().version.to_string(),
@@ -252,6 +266,29 @@ fn get_phase1_status(app: AppHandle, state: State<'_, AppState>) -> Result<Phase
         theme,
         font_family,
         settings,
+    })
+}
+
+#[tauri::command]
+fn get_popup_init_data(state: State<'_, AppState>) -> Result<PopupInitData, String> {
+    let (theme, font_family, paste_mode, clips) = {
+        let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+        let theme = db::get_setting(&conn, "theme")?.unwrap_or_else(|| "dark".to_string());
+        let font_family = db::get_setting(&conn, "font_family")?
+            .unwrap_or_else(|| "Segoe UI, Nirmala UI, sans-serif".to_string());
+        let paste_mode = db::get_setting(&conn, "paste_mode")?
+            .unwrap_or_else(|| "auto_paste".to_string());
+        let clips = db::list_clips(&conn, None, false, 150)?;
+        (theme, font_family, paste_mode, clips)
+    };
+    let paused = state.paused_flag.load(Ordering::Relaxed);
+
+    Ok(PopupInitData {
+        theme,
+        font_family,
+        paste_mode,
+        paused,
+        clips,
     })
 }
 
@@ -322,15 +359,50 @@ fn copy_clip(
 }
 
 #[tauri::command]
-fn toggle_pin_clip(state: State<'_, AppState>, clip_id: i64) -> Result<bool, String> {
-    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
-    db::toggle_pin(&conn, clip_id)
+fn paste_clip(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    clip_id: i64,
+    plain_only: Option<bool>,
+) -> Result<(), String> {
+    let item = {
+        let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+        db::get_clip_by_id(&conn, clip_id)?
+            .ok_or_else(|| "Clip not found".to_string())?
+    };
+    paste_clip_to_previous_window(&app, &item, plain_only.unwrap_or(false))
 }
 
 #[tauri::command]
-fn delete_clip(state: State<'_, AppState>, clip_id: i64) -> Result<(), String> {
-    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
-    db::delete_clip(&conn, clip_id)
+fn close_popup(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("popup") {
+        let _ = win.close();
+    }
+}
+
+#[tauri::command]
+fn set_popup_keep_open(state: State<'_, AppState>, keep_open: bool) {
+    state.popup_keep_open.store(keep_open, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn toggle_pin_clip(app: AppHandle, state: State<'_, AppState>, clip_id: i64) -> Result<bool, String> {
+    let pinned = {
+        let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+        db::toggle_pin(&conn, clip_id)?
+    };
+    let _ = app.emit("klip://clip-pinned", (clip_id, pinned));
+    Ok(pinned)
+}
+
+#[tauri::command]
+fn delete_clip(app: AppHandle, state: State<'_, AppState>, clip_id: i64) -> Result<(), String> {
+    {
+        let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+        db::delete_clip(&conn, clip_id)?;
+    }
+    let _ = app.emit("klip://clip-deleted", clip_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -384,6 +456,11 @@ pub fn run() {
         })
         .unwrap_or_else(|| "dark".to_string());
 
+    let initial_hotkey = db::get_setting(&conn, "hotkey")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "Ctrl+Shift+Backquote".to_string());
+
     let initial_excluded: Vec<String> = db::get_setting(&conn, "excluded_apps")
         .ok()
         .flatten()
@@ -411,6 +488,9 @@ pub fn run() {
         pause_menu_item: Mutex::new(None),
         allow_exit: AtomicBool::new(false),
         watcher: Mutex::new(None),
+        popup_prev_hwnd: AtomicIsize::new(0),
+        popup_keep_open: AtomicBool::new(false),
+        popup_opened_at_ms: AtomicI64::new(0),
     };
 
     let app = tauri::Builder::default()
@@ -422,14 +502,43 @@ pub fn run() {
             None,
         ))
         .manage(app_state)
+        .on_window_event(|window, event| {
+            if window.label() == "popup" {
+                match event {
+                    WindowEvent::Focused(false) => {
+                        let app_handle = window.app_handle();
+                        let state = app_handle.state::<AppState>();
+                        let keep_open = state.popup_keep_open.load(Ordering::SeqCst);
+                        let opened_at = state.popup_opened_at_ms.load(Ordering::SeqCst);
+                        let elapsed = db::now_unix_ms() - opened_at;
+                        if !keep_open && elapsed > 180 {
+                            let _ = window.close();
+                        }
+                    }
+                    WindowEvent::Moved(pos) => {
+                        let app_handle = window.app_handle();
+                        let state = app_handle.state::<AppState>();
+                        if let Ok(conn) = state.conn.lock() {
+                            let _ = db::set_setting(&conn, "popup_last_x", &pos.x.to_string());
+                            let _ = db::set_setting(&conn, "popup_last_y", &pos.y.to_string());
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_phase1_status,
+            get_popup_init_data,
             toggle_pause,
             set_theme,
             set_font_family,
             list_installed_fonts,
             list_clips,
             copy_clip,
+            paste_clip,
+            close_popup,
+            set_popup_keep_open,
             toggle_pin_clip,
             delete_clip,
             get_excluded_apps,
@@ -511,7 +620,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            let handle = clipboard::start_clipboard_listener(app.handle().clone());
+            let handle = clipboard::start_clipboard_listener(app.handle().clone(), initial_hotkey);
             {
                 let state = app.state::<AppState>();
                 if let Ok(mut guard) = state.watcher.lock() {
