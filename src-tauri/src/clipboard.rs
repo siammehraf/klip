@@ -26,7 +26,7 @@ use windows_sys::Win32::System::DataExchange::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{
-    GlobalAlloc, GlobalFree, GlobalLock, GlobalSize, GlobalUnlock,
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -40,6 +40,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW, TranslateMessage,
     HICON, HWND_MESSAGE, ICONINFO, WM_CLOSE, WM_DESTROY, WNDCLASSEXW,
 };
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GlobalFree(hmem: *mut c_void) -> *mut c_void;
+}
 
 const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
