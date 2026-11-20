@@ -1,14 +1,14 @@
 mod clipboard;
 mod db;
 
-use clipboard::ClipboardWatcherHandle;
+use clipboard::{normalize_exe_name, ClipboardWatcherHandle};
 use db::{ClipItem, SettingEntry};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -33,6 +33,8 @@ pub struct AppState {
     pub images_dir: PathBuf,
     pub app_icons_dir: PathBuf,
     pub paused: Mutex<bool>,
+    pub paused_flag: Arc<AtomicBool>,
+    pub excluded_apps_cache: Arc<RwLock<Vec<String>>>,
     pub theme: Mutex<String>,
     pub pause_menu_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     pub allow_exit: AtomicBool,
@@ -107,8 +109,8 @@ fn open_or_focus_main_window(app: &AppHandle) {
 
     if let Ok(win) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Klip")
-        .inner_size(1020.0, 680.0)
-        .min_inner_size(720.0, 480.0)
+        .inner_size(980.0, 660.0)
+        .min_inner_size(680.0, 460.0)
         .center()
         .resizable(true)
         .build()
@@ -121,6 +123,7 @@ fn open_or_focus_main_window(app: &AppHandle) {
 }
 
 fn apply_pause_state(app: &AppHandle, state: &AppState, new_paused: bool) -> Result<(), String> {
+    state.paused_flag.store(new_paused, Ordering::Relaxed);
     {
         let mut guard = state.paused.lock().map_err(|_| "Paused lock poisoned".to_string())?;
         *guard = new_paused;
@@ -325,14 +328,21 @@ fn get_excluded_apps(state: State<'_, AppState>) -> Result<Vec<String>, String> 
 
 #[tauri::command]
 fn set_excluded_apps(state: State<'_, AppState>, apps: Vec<String>) -> Result<Vec<String>, String> {
-    let cleaned: Vec<String> = apps
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut cleaned: Vec<String> = Vec::new();
+    for item in apps {
+        let norm = normalize_exe_name(&item);
+        if !norm.is_empty() && !cleaned.iter().any(|existing| existing == &norm) {
+            cleaned.push(norm);
+        }
+    }
     let json = serde_json::to_string(&cleaned).map_err(|e| format!("JSON error: {e}"))?;
-    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
-    db::set_setting(&conn, "excluded_apps", &json)?;
+    {
+        let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+        db::set_setting(&conn, "excluded_apps", &json)?;
+    }
+    if let Ok(mut guard) = state.excluded_apps_cache.write() {
+        *guard = cleaned.clone();
+    }
     Ok(cleaned)
 }
 
@@ -360,6 +370,16 @@ pub fn run() {
         })
         .unwrap_or_else(|| "dark".to_string());
 
+    let initial_excluded: Vec<String> = db::get_setting(&conn, "excluded_apps")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| normalize_exe_name(&s))
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let initial_autostart_set = db::get_setting(&conn, "autostart_initialized")
         .ok()
         .flatten()
@@ -371,6 +391,8 @@ pub fn run() {
         images_dir: storage.images_dir.clone(),
         app_icons_dir: storage.app_icons_dir.clone(),
         paused: Mutex::new(initial_paused),
+        paused_flag: Arc::new(AtomicBool::new(initial_paused)),
+        excluded_apps_cache: Arc::new(RwLock::new(initial_excluded)),
         theme: Mutex::new(initial_theme.clone()),
         pause_menu_item: Mutex::new(None),
         allow_exit: AtomicBool::new(false),
@@ -399,7 +421,6 @@ pub fn run() {
             set_excluded_apps
         ])
         .setup(move |app| {
-            // Allow asset:// reads strictly for Klip images & cached app icons
             let scope = app.asset_protocol_scope();
             let _ = scope.allow_directory(&storage.images_dir, true);
             let _ = scope.allow_directory(&storage.app_icons_dir, true);
@@ -475,7 +496,6 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Start native Win32 AddClipboardFormatListener thread
             let handle = clipboard::start_clipboard_listener(app.handle().clone());
             {
                 let state = app.state::<AppState>();

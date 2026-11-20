@@ -2,20 +2,9 @@ import { useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-interface SettingEntry {
-  key: string;
-  value: string;
-}
-
 interface Phase1Status {
   version: string;
-  db_path: string;
-  images_dir: string;
-  tables: string[];
   paused: boolean;
-  theme: "dark" | "light";
-  font_family: string;
-  settings: SettingEntry[];
 }
 
 interface ClipItem {
@@ -30,8 +19,6 @@ interface ClipItem {
   is_pinned: boolean;
   created_at: number;
 }
-
-const SYSTEM_DEFAULT_FONT = "Segoe UI, Nirmala UI, sans-serif";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -67,11 +54,11 @@ function typeLabel(clipType: string): string {
 }
 
 export default function App() {
-  const [status, setStatus] = useState<Phase1Status | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [version, setVersion] = useState("0.1.0");
   const [clips, setClips] = useState<ClipItem[]>([]);
   const [search, setSearch] = useState("");
   const [pinnedOnly, setPinnedOnly] = useState(false);
-  const [fonts, setFonts] = useState<string[]>([]);
   const [excludedApps, setExcludedApps] = useState<string[]>([]);
   const [newExcludedApp, setNewExcludedApp] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -89,33 +76,22 @@ export default function App() {
     }
   };
 
-  const loadAll = async () => {
-    try {
-      const [data, installedFonts, excluded, initialClips] = await Promise.all([
-        invoke<Phase1Status>("get_phase1_status"),
-        invoke<string[]>("list_installed_fonts"),
-        invoke<string[]>("get_excluded_apps"),
-        invoke<ClipItem[]>("list_clips", { search: "", pinnedOnly: false, limit: 200 })
-      ]);
-      setStatus(data);
-      setFonts(installedFonts);
-      setExcludedApps(excluded);
-      setClips(initialClips);
-      setError(null);
-    } catch (err) {
-      setError(String(err));
-    }
-  };
-
   useEffect(() => {
-    loadAll();
+    Promise.all([
+      invoke<Phase1Status>("get_phase1_status"),
+      invoke<string[]>("get_excluded_apps"),
+      invoke<ClipItem[]>("list_clips", { search: "", pinnedOnly: false, limit: 200 })
+    ])
+      .then(([status, excluded, initialClips]) => {
+        setPaused(status.paused);
+        setVersion(status.version);
+        setExcludedApps(excluded);
+        setClips(initialClips);
+      })
+      .catch((err) => setError(String(err)));
 
     const unlistenPause = listen<boolean>("klip://paused-changed", (event) => {
-      setStatus((prev) => (prev ? { ...prev, paused: event.payload } : prev));
-    });
-
-    const unlistenTheme = listen<"dark" | "light">("klip://theme-changed", (event) => {
-      setStatus((prev) => (prev ? { ...prev, theme: event.payload } : prev));
+      setPaused(event.payload);
     });
 
     const unlistenAdded = listen<ClipItem>("klip://clip-added", (event) => {
@@ -133,7 +109,6 @@ export default function App() {
 
     return () => {
       unlistenPause.then((fn) => fn());
-      unlistenTheme.then((fn) => fn());
       unlistenAdded.then((fn) => fn());
       unlistenPruned.then((fn) => fn());
     };
@@ -145,28 +120,8 @@ export default function App() {
 
   const handleTogglePause = async () => {
     try {
-      const paused = await invoke<boolean>("toggle_pause");
-      setStatus((prev) => (prev ? { ...prev, paused } : prev));
-    } catch (err) {
-      setError(String(err));
-    }
-  };
-
-  const handleToggleTheme = async () => {
-    if (!status) return;
-    const nextTheme = status.theme === "dark" ? "light" : "dark";
-    try {
-      await invoke("set_theme", { theme: nextTheme });
-      setStatus((prev) => (prev ? { ...prev, theme: nextTheme } : prev));
-    } catch (err) {
-      setError(String(err));
-    }
-  };
-
-  const handleFontChange = async (nextFont: string) => {
-    try {
-      await invoke("set_font_family", { fontFamily: nextFont });
-      setStatus((prev) => (prev ? { ...prev, font_family: nextFont } : prev));
+      const next = await invoke<boolean>("toggle_pause");
+      setPaused(next);
     } catch (err) {
       setError(String(err));
     }
@@ -195,12 +150,8 @@ export default function App() {
   };
 
   const handleAddExcludedApp = async () => {
-    const val = newExcludedApp.trim();
+    const val = newExcludedApp.trim().toLowerCase();
     if (!val) return;
-    if (excludedApps.some((a) => a.toLowerCase() === val.toLowerCase())) {
-      setNewExcludedApp("");
-      return;
-    }
     try {
       const updated = await invoke<string[]>("set_excluded_apps", {
         apps: [...excludedApps, val]
@@ -223,133 +174,62 @@ export default function App() {
     }
   };
 
-  const isDark = (status?.theme ?? "dark") === "dark";
-  const activeFont = status?.font_family || SYSTEM_DEFAULT_FONT;
-
   return (
-    <div
-      style={{ fontFamily: activeFont }}
-      className={`flex h-full flex-col ${
-        isDark ? "bg-[#0e1015] text-zinc-100" : "bg-zinc-50 text-zinc-900"
-      }`}
-    >
-      {/* Header */}
-      <header
-        className={`flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3.5 ${
-          isDark ? "border-zinc-800/80" : "border-zinc-200 bg-white"
-        }`}
-      >
-        <div className="flex items-center gap-3">
-          <div
-            className={`flex h-8 w-8 items-center justify-center rounded-lg border ${
-              isDark ? "border-zinc-700/70 bg-zinc-900" : "border-zinc-300 bg-zinc-100"
-            }`}
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <div className="flex h-full flex-col bg-[#0e1015] text-zinc-100">
+      {/* Minimal Header */}
+      <header className="flex items-center justify-between gap-3 border-b border-zinc-800/80 px-5 py-3">
+        <div className="flex items-center gap-2.5">
+          <div className="flex h-7 w-7 items-center justify-center rounded-md border border-zinc-700/70 bg-zinc-900">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path
                 d="M7 4v16M7 12l8-7M10.5 9.5L17 20"
-                stroke={isDark ? "#f4f4f5" : "#18181b"}
+                stroke="#f4f4f5"
                 strokeWidth="2.2"
                 strokeLinecap="round"
                 strokeLinejoin="round"
               />
             </svg>
           </div>
-          <div>
-            <h1 className="text-sm font-semibold tracking-tight">
-              Klip <span className="font-normal opacity-60">v{status?.version ?? "0.1.0"}</span>
-            </h1>
-            <p className={`text-[11px] ${isDark ? "text-zinc-400" : "text-zinc-500"}`}>
-              Phase 2 {"\u2014"} Native Windows Clipboard Listener &amp; Capture Engine
-            </p>
-          </div>
+          <h1 className="text-sm font-semibold tracking-tight">
+            Klip <span className="font-normal text-zinc-500">v{version} {"\u2014"} Phase 2 Capture Feed</span>
+          </h1>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={activeFont}
-            onChange={(e) => handleFontChange(e.target.value)}
-            aria-label="Font family"
-            className={`max-w-[180px] rounded-md border px-2 py-1 text-xs ${
-              isDark
-                ? "border-zinc-700 bg-zinc-900 text-zinc-200"
-                : "border-zinc-300 bg-zinc-50 text-zinc-900"
-            }`}
-          >
-            <option value={SYSTEM_DEFAULT_FONT}>System Default Font</option>
-            {fonts.map((fontName) => (
-              <option key={fontName} value={`"${fontName}", "Nirmala UI", sans-serif`}>
-                {fontName}
-              </option>
-            ))}
-          </select>
-
-          <button
-            type="button"
-            onClick={handleToggleTheme}
-            className={`rounded-md border px-2.5 py-1 text-xs font-medium ${
-              isDark
-                ? "border-zinc-700 bg-zinc-900 text-zinc-200 hover:bg-zinc-800"
-                : "border-zinc-300 bg-zinc-100 text-zinc-800 hover:bg-zinc-200"
-            }`}
-          >
-            {isDark ? "Dark" : "Light"}
-          </button>
-
-          <button
-            type="button"
-            onClick={handleTogglePause}
-            className={`rounded-md border px-2.5 py-1 text-xs font-medium ${
-              status?.paused
-                ? isDark
-                  ? "border-amber-700/60 bg-amber-950/40 text-amber-200"
-                  : "border-amber-400 bg-amber-50 text-amber-800"
-                : isDark
-                ? "border-emerald-700/60 bg-emerald-950/40 text-emerald-200"
-                : "border-emerald-400 bg-emerald-50 text-emerald-800"
-            }`}
-          >
-            {status?.paused ? "Paused" : "Listening"}
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={handleTogglePause}
+          className={`rounded-md border px-3 py-1 text-xs font-medium ${
+            paused
+              ? "border-amber-700/60 bg-amber-950/40 text-amber-200 hover:bg-amber-900/40"
+              : "border-emerald-700/60 bg-emerald-950/40 text-emerald-200 hover:bg-emerald-900/40"
+          }`}
+        >
+          {paused ? "Paused \u2014 Resume" : "Listening \u2014 Pause"}
+        </button>
       </header>
 
-      {/* Search + Excluded Apps Bar */}
-      <div
-        className={`flex flex-wrap items-center justify-between gap-3 border-b px-5 py-2.5 ${
-          isDark ? "border-zinc-800/70 bg-[#12151d]" : "border-zinc-200 bg-zinc-100/60"
-        }`}
-      >
+      {/* Search + Quick Exclusion Test Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-zinc-800/70 bg-[#12151d] px-5 py-2.5">
         <div className="flex flex-1 items-center gap-2 min-w-[240px]">
           <input
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Exact search (English / Bangla / app name)..."
-            className={`w-full max-w-sm rounded-md border px-3 py-1.5 text-xs outline-none ${
-              isDark
-                ? "border-zinc-700 bg-zinc-900 text-zinc-100 placeholder:text-zinc-500 focus:border-zinc-500"
-                : "border-zinc-300 bg-white text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500"
-            }`}
+            placeholder="Search all words/substrings (English, Bangla, app)..."
+            className="w-full max-w-md rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-500 outline-none focus:border-zinc-500"
           />
           <button
             type="button"
             onClick={() => setPinnedOnly((p) => !p)}
             className={`rounded-md border px-2.5 py-1.5 text-xs font-medium ${
               pinnedOnly
-                ? isDark
-                  ? "border-sky-600 bg-sky-950/60 text-sky-200"
-                  : "border-sky-500 bg-sky-50 text-sky-800"
-                : isDark
-                ? "border-zinc-700 bg-zinc-900 text-zinc-300"
-                : "border-zinc-300 bg-white text-zinc-700"
+                ? "border-sky-600 bg-sky-950/60 text-sky-200"
+                : "border-zinc-700 bg-zinc-900 text-zinc-300"
             }`}
           >
-            {pinnedOnly ? "Pinned Only" : "All History"}
+            {pinnedOnly ? "Pinned" : "All"}
           </button>
-          <span className={`text-xs ${isDark ? "text-zinc-400" : "text-zinc-500"}`}>
-            {clips.length} clips
-          </span>
+          <span className="text-xs text-zinc-400">{clips.length}</span>
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
@@ -360,21 +240,13 @@ export default function App() {
             onKeyDown={(e) => {
               if (e.key === "Enter") handleAddExcludedApp();
             }}
-            placeholder="Exclude app (e.g. notepad.exe)"
-            className={`w-44 rounded-md border px-2.5 py-1 text-xs outline-none ${
-              isDark
-                ? "border-zinc-700 bg-zinc-900 text-zinc-100 placeholder:text-zinc-500"
-                : "border-zinc-300 bg-white text-zinc-900 placeholder:text-zinc-400"
-            }`}
+            placeholder="Exclude exe (e.g. notepad.exe)"
+            className="w-44 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-100 placeholder:text-zinc-500 outline-none"
           />
           <button
             type="button"
             onClick={handleAddExcludedApp}
-            className={`rounded-md border px-2.5 py-1 text-xs ${
-              isDark
-                ? "border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
-                : "border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-100"
-            }`}
+            className="rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
           >
             Exclude
           </button>
@@ -384,11 +256,7 @@ export default function App() {
               type="button"
               onClick={() => handleRemoveExcludedApp(appName)}
               title="Click to remove exclusion"
-              className={`rounded border px-2 py-0.5 text-[11px] font-mono ${
-                isDark
-                  ? "border-rose-800/70 bg-rose-950/40 text-rose-200 hover:bg-rose-900/50"
-                  : "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100"
-              }`}
+              className="rounded border border-rose-800/70 bg-rose-950/40 px-2 py-0.5 font-mono text-[11px] text-rose-200 hover:bg-rose-900/50"
             >
               {appName} &times;
             </button>
@@ -396,7 +264,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* Live Clipboard Feed */}
+      {/* Live Feed */}
       <main className="flex-1 overflow-auto p-5">
         {error && (
           <div className="mb-4 rounded-lg border border-red-700/60 bg-red-950/30 p-3 text-xs text-red-400">
@@ -405,14 +273,10 @@ export default function App() {
         )}
 
         {clips.length === 0 ? (
-          <div
-            className={`mx-auto mt-12 max-w-md rounded-xl border p-6 text-center ${
-              isDark ? "border-zinc-800 bg-[#14171f]" : "border-zinc-200 bg-white"
-            }`}
-          >
-            <p className="text-sm font-medium">No captured clips yet</p>
-            <p className={`mt-1.5 text-xs ${isDark ? "text-zinc-400" : "text-zinc-500"}`}>
-              Copy text (English or Bangla), a link, hex color (#3b82f6), code snippet, or a screenshot (Win+Shift+S). Clips appear here instantly.
+          <div className="mx-auto mt-12 max-w-md rounded-xl border border-zinc-800 bg-[#14171f] p-6 text-center">
+            <p className="text-sm font-medium">No matching clips</p>
+            <p className="mt-1.5 text-xs text-zinc-400">
+              Copy text, Bangla Unicode, links, colors (#3b82f6), code, or screenshots (Win+Shift+S).
             </p>
           </div>
         ) : (
@@ -420,9 +284,7 @@ export default function App() {
             {clips.map((clip) => (
               <article
                 key={clip.id}
-                className={`rounded-xl border p-3.5 ${
-                  isDark ? "border-zinc-800/90 bg-[#14171f]" : "border-zinc-200 bg-white"
-                }`}
+                className="rounded-xl border border-zinc-800/90 bg-[#14171f] p-3.5"
               >
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2 text-xs">
@@ -433,22 +295,30 @@ export default function App() {
                         className="h-4 w-4 rounded-sm object-contain"
                       />
                     ) : (
-                      <span
-                        className={`inline-block h-4 w-4 rounded-sm ${
-                          isDark ? "bg-zinc-800" : "bg-zinc-200"
-                        }`}
-                      />
+                      <svg
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        className="text-zinc-500"
+                        aria-hidden="true"
+                      >
+                        <rect
+                          x="3"
+                          y="4"
+                          width="18"
+                          height="16"
+                          rx="2"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                        />
+                        <path d="M3 9h18" stroke="currentColor" strokeWidth="1.8" />
+                      </svg>
                     )}
-                    <span className="font-medium">
+                    <span className="font-medium text-zinc-200">
                       {clip.source_app ?? "Unknown app"}
                     </span>
-                    <span
-                      className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${
-                        isDark
-                          ? "border-zinc-700 bg-zinc-900 text-zinc-300"
-                          : "border-zinc-300 bg-zinc-100 text-zinc-700"
-                      }`}
-                    >
+                    <span className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-zinc-300">
                       {typeLabel(clip.clip_type)}
                     </span>
                     {clip.clip_type === "color" && clip.text_content && (
@@ -457,7 +327,7 @@ export default function App() {
                         style={{ backgroundColor: clip.text_content.trim() }}
                       />
                     )}
-                    <span className={`text-[11px] ${isDark ? "text-zinc-500" : "text-zinc-400"}`}>
+                    <span className="text-[11px] text-zinc-500">
                       {formatTime(clip.created_at)} {"\u2022"} {formatBytes(clip.content_size)}
                     </span>
                   </div>
@@ -468,12 +338,8 @@ export default function App() {
                       onClick={() => handleTogglePin(clip.id)}
                       className={`rounded border px-2 py-0.5 text-[11px] ${
                         clip.is_pinned
-                          ? isDark
-                            ? "border-amber-600/70 bg-amber-950/50 text-amber-200"
-                            : "border-amber-400 bg-amber-50 text-amber-800"
-                          : isDark
-                          ? "border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800"
-                          : "border-zinc-300 bg-zinc-50 text-zinc-700 hover:bg-zinc-100"
+                          ? "border-amber-600/70 bg-amber-950/50 text-amber-200"
+                          : "border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800"
                       }`}
                     >
                       {clip.is_pinned ? "Pinned" : "Pin"}
@@ -481,11 +347,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => handleDelete(clip.id)}
-                      className={`rounded border px-2 py-0.5 text-[11px] ${
-                        isDark
-                          ? "border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-red-800 hover:text-red-300"
-                          : "border-zinc-300 bg-zinc-50 text-zinc-600 hover:border-red-300 hover:text-red-600"
-                      }`}
+                      className="rounded border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-[11px] text-zinc-400 hover:border-red-800 hover:text-red-300"
                     >
                       Delete
                     </button>
@@ -497,22 +359,16 @@ export default function App() {
                     <img
                       src={convertFileSrc(clip.image_path)}
                       alt="Captured clip"
-                      className={`max-h-40 max-w-full rounded-lg border object-contain ${
-                        isDark ? "border-zinc-800 bg-zinc-950" : "border-zinc-200 bg-zinc-100"
-                      }`}
+                      className="max-h-40 max-w-full rounded-lg border border-zinc-800 bg-zinc-950 object-contain"
                     />
-                    <span className={`text-[11px] font-mono ${isDark ? "text-zinc-400" : "text-zinc-500"}`}>
+                    <span className="font-mono text-[11px] text-zinc-400">
                       {clip.text_content}
                     </span>
                   </div>
                 ) : (
                   <pre
-                    className={`mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words rounded-lg border p-2.5 text-xs ${
+                    className={`mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-zinc-800/80 bg-zinc-900/70 p-2.5 text-xs text-zinc-200 ${
                       clip.clip_type === "code" ? "font-mono" : ""
-                    } ${
-                      isDark
-                        ? "border-zinc-800/80 bg-zinc-900/70 text-zinc-200"
-                        : "border-zinc-200 bg-zinc-50 text-zinc-800"
                     }`}
                   >
                     {clip.text_content ?? "(Rich HTML content)"}

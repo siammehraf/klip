@@ -9,11 +9,12 @@ use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{BOOL, CloseHandle, FALSE, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
     BITMAPINFOHEADER, BI_BITFIELDS, BI_RGB, DIB_RGB_COLORS,
@@ -28,12 +29,14 @@ use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+use windows_sys::Win32::UI::Shell::{
+    ExtractIconExW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    GetForegroundWindow, GetIconInfo, GetMessageW, GetWindowThreadProcessId, PostMessageW,
-    PostQuitMessage, RegisterClassExW, TranslateMessage, HWND_MESSAGE, ICONINFO, WM_CLOSE,
-    WM_DESTROY, WNDCLASSEXW,
+    EnumChildWindows, GetClassNameW, GetForegroundWindow, GetIconInfo, GetMessageW,
+    GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW, TranslateMessage,
+    HICON, HWND_MESSAGE, ICONINFO, WM_CLOSE, WM_DESTROY, WNDCLASSEXW,
 };
 
 const CF_DIB: u32 = 8;
@@ -41,6 +44,8 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
 const CF_DIBV5: u32 = 17;
 const WM_CLIPBOARDUPDATE: u32 = 0x031D;
+const WS_EX_TOOLWINDOW_FLAG: u32 = 0x0000_0080;
+const WS_EX_NOACTIVATE_FLAG: u32 = 0x0800_0000;
 
 static IMAGE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -52,10 +57,29 @@ struct FormatIds {
     can_include_history: u32,
 }
 
+enum RawClipboardPayload {
+    ImagePng {
+        png_bytes: Vec<u8>,
+        source_proc: Option<(String, PathBuf)>,
+        created_at: i64,
+    },
+    ImageDib {
+        dib_bytes: Vec<u8>,
+        source_proc: Option<(String, PathBuf)>,
+        created_at: i64,
+    },
+    Text {
+        text: Option<String>,
+        html: Option<String>,
+        source_proc: Option<(String, PathBuf)>,
+        created_at: i64,
+    },
+}
+
 struct ListenerContext {
     app: AppHandle,
     formats: FormatIds,
-    cached_icons: HashSet<String>,
+    worker_tx: Option<Sender<RawClipboardPayload>>,
 }
 
 thread_local! {
@@ -90,12 +114,12 @@ struct ClipboardLock;
 
 impl ClipboardLock {
     fn acquire(hwnd: HWND) -> Option<Self> {
-        for _ in 0..6 {
+        for _ in 0..5 {
             let ok = unsafe { OpenClipboard(hwnd) };
             if ok != 0 {
                 return Some(Self);
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(8));
         }
         None
     }
@@ -153,11 +177,66 @@ fn is_privacy_blocked(formats: &FormatIds) -> bool {
     false
 }
 
-fn resolve_source_process() -> Option<(String, PathBuf)> {
+struct ChildAppSearch {
+    host_pid: u32,
+    core_pid: u32,
+    any_other_pid: u32,
+}
+
+unsafe extern "system" fn enum_frame_child_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = &mut *(lparam as *mut ChildAppSearch);
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid != 0 && pid != search.host_pid {
+        let mut cls = [0u16; 128];
+        let len = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
+        if len > 0 {
+            let name = String::from_utf16_lossy(&cls[..len as usize]);
+            if name == "Windows.UI.Core.CoreWindow" {
+                search.core_pid = pid;
+                return 0;
+            }
+        }
+        if search.any_other_pid == 0 {
+            search.any_other_pid = pid;
+        }
+    }
+    1
+}
+
+unsafe fn query_process_image(pid: u32) -> Option<(String, PathBuf)> {
+    if pid == 0 {
+        return None;
+    }
+    let proc_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if proc_handle.is_null() {
+        return None;
+    }
+
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(proc_handle, 0, buf.as_mut_ptr(), &mut len);
+    CloseHandle(proc_handle);
+
+    if ok == 0 || len == 0 {
+        return None;
+    }
+
+    let full_path = String::from_utf16_lossy(&buf[..len as usize]);
+    let path = PathBuf::from(&full_path);
+    let exe_name = path.file_name()?.to_str()?.trim().to_string();
+    if exe_name.is_empty() {
+        return None;
+    }
+
+    Some((exe_name, path))
+}
+
+fn get_source_app_info() -> Option<(String, PathBuf)> {
     unsafe {
-        let mut hwnd = GetClipboardOwner();
+        let mut hwnd = GetForegroundWindow();
         if hwnd.is_null() {
-            hwnd = GetForegroundWindow();
+            hwnd = GetClipboardOwner();
         }
         if hwnd.is_null() {
             return None;
@@ -169,43 +248,72 @@ fn resolve_source_process() -> Option<(String, PathBuf)> {
             return None;
         }
 
-        let proc_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if proc_handle.is_null() {
-            return None;
+        let mut cls = [0u16; 128];
+        let cls_len = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
+        let cls_name = if cls_len > 0 {
+            String::from_utf16_lossy(&cls[..cls_len as usize])
+        } else {
+            String::new()
+        };
+
+        // Windows 11 UWP / Packaged apps (e.g. Notepad, Settings) host CoreWindow inside ApplicationFrameWindow
+        if cls_name == "ApplicationFrameWindow" {
+            let mut search = ChildAppSearch {
+                host_pid: pid,
+                core_pid: 0,
+                any_other_pid: 0,
+            };
+            EnumChildWindows(
+                hwnd,
+                Some(enum_frame_child_proc),
+                &mut search as *mut _ as LPARAM,
+            );
+            let real_pid = if search.core_pid != 0 {
+                search.core_pid
+            } else if search.any_other_pid != 0 {
+                search.any_other_pid
+            } else {
+                pid
+            };
+            if let Some(info) = query_process_image(real_pid) {
+                return Some(info);
+            }
         }
 
-        let mut buf = vec![0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(proc_handle, 0, buf.as_mut_ptr(), &mut len);
-        CloseHandle(proc_handle);
-
-        if ok == 0 || len == 0 {
-            return None;
+        if let Some(info) = query_process_image(pid) {
+            return Some(info);
         }
 
-        let full_path = String::from_utf16_lossy(&buf[..len as usize]);
-        let path = PathBuf::from(&full_path);
-        let exe_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())?;
+        // Last resort: check clipboard owner if foreground query failed
+        let owner = GetClipboardOwner();
+        if !owner.is_null() && owner != hwnd {
+            let mut owner_pid: u32 = 0;
+            GetWindowThreadProcessId(owner, &mut owner_pid);
+            return query_process_image(owner_pid);
+        }
 
-        Some((exe_name, path))
+        None
     }
 }
 
-fn is_app_excluded(excluded_json: &str, exe_name: &str) -> bool {
-    let list: Vec<String> = serde_json::from_str(excluded_json).unwrap_or_default();
-    let target_lower = exe_name.to_lowercase();
-    let target_stem = target_lower.strip_suffix(".exe").unwrap_or(&target_lower);
+pub fn normalize_exe_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
 
-    list.iter().any(|entry| {
-        let e = entry.trim().to_lowercase();
+fn is_app_excluded(excluded_list: &[String], exe_name: &str) -> bool {
+    let target = normalize_exe_name(exe_name);
+    if target.is_empty() {
+        return false;
+    }
+    let target_stem = target.strip_suffix(".exe").unwrap_or(&target);
+
+    excluded_list.iter().any(|entry| {
+        let e = normalize_exe_name(entry);
         if e.is_empty() {
             return false;
         }
         let e_stem = e.strip_suffix(".exe").unwrap_or(&e);
-        e == target_lower || e_stem == target_stem
+        e == target || e_stem == target_stem
     })
 }
 
@@ -263,12 +371,26 @@ fn ensure_app_icon(
             size_of::<SHFILEINFOW>() as u32,
             SHGFI_ICON | SHGFI_LARGEICON,
         );
-        if res == 0 || shfi.hIcon.is_null() {
+        let mut hicon = if res != 0 && !shfi.hIcon.is_null() {
+            shfi.hIcon
+        } else {
+            null_mut()
+        };
+
+        if hicon.is_null() {
+            let mut large_icon: HICON = null_mut();
+            let extracted = ExtractIconExW(wide_path.as_ptr(), 0, &mut large_icon, null_mut(), 1);
+            if extracted > 0 && !large_icon.is_null() {
+                hicon = large_icon;
+            }
+        }
+
+        if hicon.is_null() {
             return None;
         }
 
-        let png_bytes = hicon_to_png(shfi.hIcon);
-        DestroyIcon(shfi.hIcon);
+        let png_bytes = hicon_to_png(hicon);
+        DestroyIcon(hicon);
 
         if let Ok(bytes) = png_bytes {
             if fs::write(&dest_path, bytes).is_ok() {
@@ -281,7 +403,7 @@ fn ensure_app_icon(
     None
 }
 
-unsafe fn hicon_to_png(hicon: windows_sys::Win32::UI::WindowsAndMessaging::HICON) -> Result<Vec<u8>, String> {
+unsafe fn hicon_to_png(hicon: HICON) -> Result<Vec<u8>, String> {
     let mut icon_info: ICONINFO = zeroed();
     if GetIconInfo(hicon, &mut icon_info) == 0 {
         return Err("GetIconInfo failed".into());
@@ -328,7 +450,7 @@ unsafe fn hicon_to_png(hicon: windows_sys::Win32::UI::WindowsAndMessaging::HICON
     let mut bmi: BITMAPINFO = zeroed();
     bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
     bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h; // top-down
+    bmi.bmiHeader.biHeight = -h;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -346,13 +468,12 @@ unsafe fn hicon_to_png(hicon: windows_sys::Win32::UI::WindowsAndMessaging::HICON
 
     let mut has_alpha = false;
     for px in bgra.chunks_exact_mut(4) {
-        px.swap(0, 2); // BGRA -> RGBA
+        px.swap(0, 2);
         if px[3] != 0 {
             has_alpha = true;
         }
     }
 
-    // Legacy 24-bit icons store transparency in hbmMask
     if !has_alpha && !icon_info.hbmMask.is_null() {
         let mut mask_bgra = vec![0u8; (w * h * 4) as usize];
         let mask_lines = GetDIBits(
@@ -757,17 +878,14 @@ fn detect_text_clip_type(text: &str, has_html: bool) -> &'static str {
     "text"
 }
 
-fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
-    let state = ctx.app.state::<AppState>();
+fn process_payload(
+    app: &AppHandle,
+    payload: RawClipboardPayload,
+    cached_icons: &mut HashSet<String>,
+) {
+    let state = app.state::<AppState>();
 
-    // Respect Pause Saving immediately without touching the clipboard
-    if state.paused.lock().map(|g| *g).unwrap_or(false) {
-        return;
-    }
-
-    let max_bytes: usize;
-    let excluded_json: String;
-    {
+    let max_bytes: usize = {
         let Ok(conn) = state.conn.lock() else {
             return;
         };
@@ -777,63 +895,123 @@ fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(10)
             .max(1);
-        max_bytes = max_mb * 1024 * 1024;
-        excluded_json = db::get_setting(&conn, "excluded_apps")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "[]".to_string());
-    }
-
-    let source_proc = resolve_source_process();
-    if let Some((ref exe_name, _)) = source_proc {
-        if is_app_excluded(&excluded_json, exe_name) {
-            return;
-        }
-    }
-
-    let _lock = match ClipboardLock::acquire(hwnd) {
-        Some(l) => l,
-        None => return,
+        max_mb * 1024 * 1024
     };
 
-    // Ignore files and folders (CF_HDROP)
-    unsafe {
-        if IsClipboardFormatAvailable(CF_HDROP) != 0 {
-            return;
+    match payload {
+        RawClipboardPayload::ImagePng {
+            png_bytes,
+            source_proc,
+            created_at,
+        } => {
+            if let Some((w, h)) = read_png_dimensions(&png_bytes) {
+                save_image_clip(
+                    app,
+                    &state,
+                    &png_bytes,
+                    w,
+                    h,
+                    source_proc,
+                    created_at,
+                    max_bytes,
+                    cached_icons,
+                );
+            }
+        }
+        RawClipboardPayload::ImageDib {
+            dib_bytes,
+            source_proc,
+            created_at,
+        } => {
+            if let Ok((png_bytes, w, h)) = dib_to_png(&dib_bytes) {
+                save_image_clip(
+                    app,
+                    &state,
+                    &png_bytes,
+                    w,
+                    h,
+                    source_proc,
+                    created_at,
+                    max_bytes,
+                    cached_icons,
+                );
+            }
+        }
+        RawClipboardPayload::Text {
+            text,
+            html,
+            source_proc,
+            created_at,
+        } => {
+            let text_bytes = text.as_ref().map(|s| s.len()).unwrap_or(0);
+            let html_bytes = html.as_ref().map(|s| s.len()).unwrap_or(0);
+            let total_size = text_bytes + html_bytes;
+
+            if total_size == 0 || total_size > max_bytes {
+                return;
+            }
+
+            let clip_type = match text.as_deref() {
+                Some(t) => detect_text_clip_type(t, html.is_some()),
+                None => "rich_text",
+            };
+
+            let (source_app, source_icon_path) = match source_proc {
+                Some((exe_name, exe_path)) => {
+                    let icon = ensure_app_icon(
+                        &exe_name,
+                        &exe_path,
+                        &state.app_icons_dir,
+                        cached_icons,
+                    );
+                    (Some(exe_name), icon)
+                }
+                None => (None, None),
+            };
+
+            let inserted: Result<ClipItem, String> = (|| {
+                let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+                let item = db::insert_clip(
+                    &conn,
+                    &NewClip {
+                        clip_type,
+                        text_content: text.as_deref(),
+                        html_content: html.as_deref(),
+                        image_path: None,
+                        content_size: total_size as i64,
+                        source_app: source_app.as_deref(),
+                        source_icon_path: source_icon_path.as_deref(),
+                        created_at,
+                    },
+                )?;
+                let removed = db::enforce_retention_and_limits(&conn)?;
+                if !removed.is_empty() {
+                    let _ = app.emit("klip://clips-pruned", removed);
+                }
+                Ok(item)
+            })();
+
+            if let Ok(item) = inserted {
+                let _ = app.emit("klip://clip-added", item);
+            }
         }
     }
+}
 
-    // Respect Bitwarden / KeePassXC / Windows password manager privacy flags
-    if is_privacy_blocked(&ctx.formats) {
+#[allow(clippy::too_many_arguments)]
+fn save_image_clip(
+    app: &AppHandle,
+    state: &AppState,
+    png_bytes: &[u8],
+    w: u32,
+    h: u32,
+    source_proc: Option<(String, PathBuf)>,
+    created_at: i64,
+    max_bytes: usize,
+    cached_icons: &mut HashSet<String>,
+) {
+    if png_bytes.is_empty() || png_bytes.len() > max_bytes {
         return;
-    }
-
-    let now_ms = db::now_unix_ms();
-
-    // Extract image first if available (PNG -> CF_DIBV5 -> CF_DIB)
-    let mut image_payload: Option<(Vec<u8>, u32, u32)> = None;
-    unsafe {
-        if ctx.formats.png != 0 && IsClipboardFormatAvailable(ctx.formats.png) != 0 {
-            if let Some(raw_png) = read_global_bytes(GetClipboardData(ctx.formats.png)) {
-                if let Some((w, h)) = read_png_dimensions(&raw_png) {
-                    image_payload = Some((raw_png, w, h));
-                }
-            }
-        }
-        if image_payload.is_none() && IsClipboardFormatAvailable(CF_DIBV5) != 0 {
-            if let Some(dib) = read_global_bytes(GetClipboardData(CF_DIBV5)) {
-                if let Ok(parsed) = dib_to_png(&dib) {
-                    image_payload = Some(parsed);
-                }
-            }
-        }
-        if image_payload.is_none() && IsClipboardFormatAvailable(CF_DIB) != 0 {
-            if let Some(dib) = read_global_bytes(GetClipboardData(CF_DIB)) {
-                if let Ok(parsed) = dib_to_png(&dib) {
-                    image_payload = Some(parsed);
-                }
-            }
-        }
     }
 
     let (source_app, source_icon_path) = match source_proc {
@@ -842,95 +1020,134 @@ fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
                 &exe_name,
                 &exe_path,
                 &state.app_icons_dir,
-                &mut ctx.cached_icons,
+                cached_icons,
             );
             (Some(exe_name), icon)
         }
         None => (None, None),
     };
 
-    if let Some((png_bytes, w, h)) = image_payload {
-        if png_bytes.len() > max_bytes {
-            return;
-        }
-        let seq = IMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let file_name = format!("{now_ms}_{seq}.png");
-        let full_path = state.images_dir.join(file_name);
-        if fs::write(&full_path, &png_bytes).is_err() {
-            return;
-        }
-
-        let dims_text = format!("{w}x{h}");
-        let path_str = full_path.to_string_lossy().into_owned();
-        let inserted: Result<ClipItem, String> = (|| {
-            let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
-            let item = db::insert_clip(
-                &conn,
-                &NewClip {
-                    clip_type: "image",
-                    text_content: Some(&dims_text),
-                    html_content: None,
-                    image_path: Some(&path_str),
-                    content_size: png_bytes.len() as i64,
-                    source_app: source_app.as_deref(),
-                    source_icon_path: source_icon_path.as_deref(),
-                    created_at: now_ms,
-                },
-            )?;
-            let removed = db::enforce_retention_and_limits(&conn)?;
-            if !removed.is_empty() {
-                let _ = ctx.app.emit("klip://clips-pruned", removed);
-            }
-            Ok(item)
-        })();
-
-        if let Ok(item) = inserted {
-            let _ = ctx.app.emit("klip://clip-added", item);
-        }
+    let seq = IMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = format!("{created_at}_{seq}.png");
+    let full_path = state.images_dir.join(file_name);
+    if fs::write(&full_path, png_bytes).is_err() {
         return;
     }
 
-    // Otherwise extract text + optional HTML payload
-    let text_opt = read_unicode_text();
-    let html_opt = read_html_format(ctx.formats.html);
-
-    let text_bytes = text_opt.as_ref().map(|s| s.len()).unwrap_or(0);
-    let html_bytes = html_opt.as_ref().map(|s| s.len()).unwrap_or(0);
-    let total_size = text_bytes + html_bytes;
-
-    if total_size == 0 || total_size > max_bytes {
-        return;
-    }
-
-    let clip_type = match text_opt.as_deref() {
-        Some(t) => detect_text_clip_type(t, html_opt.is_some()),
-        None => "rich_text",
-    };
-
+    let dims_text = format!("{w}x{h}");
+    let path_str = full_path.to_string_lossy().into_owned();
     let inserted: Result<ClipItem, String> = (|| {
         let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
         let item = db::insert_clip(
             &conn,
             &NewClip {
-                clip_type,
-                text_content: text_opt.as_deref(),
-                html_content: html_opt.as_deref(),
-                image_path: None,
-                content_size: total_size as i64,
+                clip_type: "image",
+                text_content: Some(&dims_text),
+                html_content: None,
+                image_path: Some(&path_str),
+                content_size: png_bytes.len() as i64,
                 source_app: source_app.as_deref(),
                 source_icon_path: source_icon_path.as_deref(),
-                created_at: now_ms,
+                created_at,
             },
         )?;
         let removed = db::enforce_retention_and_limits(&conn)?;
         if !removed.is_empty() {
-            let _ = ctx.app.emit("klip://clips-pruned", removed);
+            let _ = app.emit("klip://clips-pruned", removed);
         }
         Ok(item)
     })();
 
     if let Ok(item) = inserted {
-        let _ = ctx.app.emit("klip://clip-added", item);
+        let _ = app.emit("klip://clip-added", item);
+    }
+}
+
+fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
+    let state = ctx.app.state::<AppState>();
+
+    // Fast lock-free pause check
+    if state.paused_flag.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // Resolve foreground/UWP app before touching the clipboard
+    let source_proc = get_source_app_info();
+    if let Some((ref exe_name, _)) = source_proc {
+        if let Ok(excluded) = state.excluded_apps_cache.read() {
+            if is_app_excluded(&excluded, exe_name) {
+                return;
+            }
+        }
+    }
+
+    let created_at = db::now_unix_ms();
+
+    // Acquire clipboard ONLY long enough to copy raw bytes, then CloseClipboard immediately
+    let payload: Option<RawClipboardPayload> = {
+        let _lock = match ClipboardLock::acquire(hwnd) {
+            Some(l) => l,
+            None => return,
+        };
+
+        unsafe {
+            if IsClipboardFormatAvailable(CF_HDROP) != 0 {
+                return;
+            }
+        }
+
+        if is_privacy_blocked(&ctx.formats) {
+            return;
+        }
+
+        unsafe {
+            if ctx.formats.png != 0 && IsClipboardFormatAvailable(ctx.formats.png) != 0 {
+                if let Some(png_bytes) = read_global_bytes(GetClipboardData(ctx.formats.png)) {
+                    Some(RawClipboardPayload::ImagePng {
+                        png_bytes,
+                        source_proc,
+                        created_at,
+                    })
+                } else {
+                    None
+                }
+            } else if IsClipboardFormatAvailable(CF_DIBV5) != 0 {
+                read_global_bytes(GetClipboardData(CF_DIBV5)).map(|dib_bytes| {
+                    RawClipboardPayload::ImageDib {
+                        dib_bytes,
+                        source_proc,
+                        created_at,
+                    }
+                })
+            } else if IsClipboardFormatAvailable(CF_DIB) != 0 {
+                read_global_bytes(GetClipboardData(CF_DIB)).map(|dib_bytes| {
+                    RawClipboardPayload::ImageDib {
+                        dib_bytes,
+                        source_proc,
+                        created_at,
+                    }
+                })
+            } else {
+                let text = read_unicode_text();
+                let html = read_html_format(ctx.formats.html);
+                if text.is_some() || html.is_some() {
+                    Some(RawClipboardPayload::Text {
+                        text,
+                        html,
+                        source_proc,
+                        created_at,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+    }; // _lock drops here -> CloseClipboard() runs immediately before any PNG/SQLite work
+
+    if let Some(p) = payload {
+        if let Some(tx) = ctx.worker_tx.as_ref() {
+            let _ = tx.send(p);
+        }
     }
 }
 
@@ -964,6 +1181,19 @@ pub fn start_clipboard_listener(app: AppHandle) -> ClipboardWatcherHandle {
     let hwnd_holder = Arc::new(AtomicIsize::new(0));
     let hwnd_for_thread = Arc::clone(&hwnd_holder);
 
+    let (tx, rx) = mpsc::channel::<RawClipboardPayload>();
+    let worker_app = app.clone();
+
+    thread::Builder::new()
+        .name("klip-capture-worker".to_string())
+        .spawn(move || {
+            let mut cached_icons = HashSet::new();
+            while let Ok(payload) = rx.recv() {
+                process_payload(&worker_app, payload, &mut cached_icons);
+            }
+        })
+        .expect("Failed to spawn Klip capture worker thread");
+
     thread::Builder::new()
         .name("klip-clipboard-listener".to_string())
         .spawn(move || unsafe {
@@ -980,7 +1210,7 @@ pub fn start_clipboard_listener(app: AppHandle) -> ClipboardWatcherHandle {
             RegisterClassExW(&wc);
 
             let hwnd = CreateWindowExW(
-                0,
+                WS_EX_NOACTIVATE_FLAG | WS_EX_TOOLWINDOW_FLAG,
                 class_name.as_ptr(),
                 window_title.as_ptr(),
                 0,
@@ -1012,7 +1242,7 @@ pub fn start_clipboard_listener(app: AppHandle) -> ClipboardWatcherHandle {
                 *cell.borrow_mut() = Some(ListenerContext {
                     app,
                     formats,
-                    cached_icons: HashSet::new(),
+                    worker_tx: Some(tx),
                 });
             });
 

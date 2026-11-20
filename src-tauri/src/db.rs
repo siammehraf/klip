@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -284,81 +284,64 @@ pub fn list_clips(
     pinned_only: bool,
     limit: i64,
 ) -> Result<Vec<ClipItem>, String> {
-    let q = search.unwrap_or("").trim();
-    let has_search = !q.is_empty();
-    let like_pattern = format!("%{}%", escape_like_pattern(q));
+    let terms: Vec<String> = search
+        .unwrap_or("")
+        .split_whitespace()
+        .take(12)
+        .map(|w| format!("%{}%", escape_like_pattern(w)))
+        .collect();
 
-    let sql = match (pinned_only, has_search) {
-        (true, true) => {
-            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
-                    source_app, source_icon_path, is_pinned, created_at
-             FROM clips
-             WHERE is_pinned = 1
-               AND (text_content LIKE ?1 ESCAPE '\\' OR source_app LIKE ?1 ESCAPE '\\' OR clip_type LIKE ?1 ESCAPE '\\')
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?2"
-        }
-        (true, false) => {
-            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
-                    source_app, source_icon_path, is_pinned, created_at
-             FROM clips
-             WHERE is_pinned = 1
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?1"
-        }
-        (false, true) => {
-            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
-                    source_app, source_icon_path, is_pinned, created_at
-             FROM clips
-             WHERE (text_content LIKE ?1 ESCAPE '\\' OR source_app LIKE ?1 ESCAPE '\\' OR clip_type LIKE ?1 ESCAPE '\\')
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?2"
-        }
-        (false, false) => {
-            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
-                    source_app, source_icon_path, is_pinned, created_at
-             FROM clips
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?1"
-        }
-    };
+    let mut sql = String::from(
+        "SELECT id, clip_type, text_content, html_content, image_path, content_size,
+                source_app, source_icon_path, is_pinned, created_at
+         FROM clips
+         WHERE 1=1",
+    );
 
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed preparing list_clips: {e}"))?;
-
-    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ClipItem> {
-        Ok(ClipItem {
-            id: row.get(0)?,
-            clip_type: row.get(1)?,
-            text_content: row.get(2)?,
-            html_content: row.get(3)?,
-            image_path: row.get(4)?,
-            content_size: row.get(5)?,
-            source_app: row.get(6)?,
-            source_icon_path: row.get(7)?,
-            is_pinned: row.get::<_, i64>(8)? != 0,
-            created_at: row.get(9)?,
-        })
-    };
-
-    let mut items = Vec::new();
-    if has_search {
-        let rows = stmt
-            .query_map(params![like_pattern, limit], map_row)
-            .map_err(|e| format!("Failed querying clips: {e}"))?;
-        for r in rows {
-            items.push(r.map_err(|e| format!("Failed reading clip row: {e}"))?);
-        }
-    } else {
-        let rows = stmt
-            .query_map(params![limit], map_row)
-            .map_err(|e| format!("Failed querying clips: {e}"))?;
-        for r in rows {
-            items.push(r.map_err(|e| format!("Failed reading clip row: {e}"))?);
-        }
+    if pinned_only {
+        sql.push_str(" AND is_pinned = 1");
     }
 
+    let mut bind_values: Vec<Value> = Vec::with_capacity(terms.len() + 1);
+    for (idx, pattern) in terms.iter().enumerate() {
+        let p_num = idx + 1;
+        sql.push_str(&format!(
+            " AND (COALESCE(text_content, '') LIKE ?{p_num} ESCAPE '\\' OR COALESCE(source_app, '') LIKE ?{p_num} ESCAPE '\\' OR clip_type LIKE ?{p_num} ESCAPE '\\')"
+        ));
+        bind_values.push(Value::Text(pattern.clone()));
+    }
+
+    let limit_param = bind_values.len() + 1;
+    sql.push_str(&format!(
+        " ORDER BY created_at DESC, id DESC LIMIT ?{limit_param}"
+    ));
+    bind_values.push(Value::Integer(limit));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed preparing list_clips: {e}"))?;
+
+    let rows = stmt
+        .query_map(params_from_iter(bind_values), |row| {
+            Ok(ClipItem {
+                id: row.get(0)?,
+                clip_type: row.get(1)?,
+                text_content: row.get(2)?,
+                html_content: row.get(3)?,
+                image_path: row.get(4)?,
+                content_size: row.get(5)?,
+                source_app: row.get(6)?,
+                source_icon_path: row.get(7)?,
+                is_pinned: row.get::<_, i64>(8)? != 0,
+                created_at: row.get(9)?,
+            })
+        })
+        .map_err(|e| format!("Failed querying clips: {e}"))?;
+
+    let mut items = Vec::new();
+    for r in rows {
+        items.push(r.map_err(|e| format!("Failed reading clip row: {e}"))?);
+    }
     Ok(items)
 }
 
@@ -412,7 +395,6 @@ pub fn enforce_retention_and_limits(conn: &Connection) -> Result<Vec<i64>, Strin
     let mut removed_ids = Vec::new();
     let now_ms = now_unix_ms();
 
-    // 1. Retention days (never purge pinned clips)
     let retention_raw = get_setting(conn, "retention_days")?.unwrap_or_else(|| "30".to_string());
     if retention_raw != "all" {
         if let Ok(days) = retention_raw.parse::<i64>() {
@@ -445,7 +427,6 @@ pub fn enforce_retention_and_limits(conn: &Connection) -> Result<Vec<i64>, Strin
         }
     }
 
-    // 2. Collection limit (never purge pinned clips)
     let limit_raw = get_setting(conn, "collection_limit")?.unwrap_or_else(|| "1000".to_string());
     if limit_raw != "unlimited" {
         if let Ok(limit) = limit_raw.parse::<i64>() {
