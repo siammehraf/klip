@@ -260,7 +260,7 @@ export default function App() {
               Klip <span className="font-normal opacity-60">v{status?.version ?? "0.1.0"}</span>
             </h1>
             <p className={`text-[11px] ${isDark ? "text-zinc-400" : "text-zinc-500"}`}>
-              Phase 2 \u2014 Native Windows Clipboard Listener &amp; Capture Engine
+              Phase 2 {"\u2014"} Native Windows Clipboard Listener &amp; Capture Engine
             </p>
           </div>
         </div>
@@ -458,7 +458,7 @@ export default function App() {
                       />
                     )}
                     <span className={`text-[11px] ${isDark ? "text-zinc-500" : "text-zinc-400"}`}>
-                      {formatTime(clip.created_at)} \u2022 {formatBytes(clip.content_size)}
+                      {formatTime(clip.created_at)} {"\u2022"} {formatBytes(clip.content_size)}
                     </span>
                   </div>
 
