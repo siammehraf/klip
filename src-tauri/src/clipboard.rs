@@ -36,7 +36,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, GetClassNameW, GetForegroundWindow, GetIconInfo, GetMessageW,
+    EnumChildWindows, GetClassNameW, GetForegroundWindow, GetIconInfo, GetMessageW, GetWindowTextW,
     GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW, TranslateMessage,
     HICON, HWND_MESSAGE, ICONINFO, WM_CLOSE, WM_DESTROY, WNDCLASSEXW,
 };
@@ -515,36 +515,132 @@ fn is_browser_exe(exe_name: &str) -> bool {
     )
 }
 
-fn extract_source_site(raw_html: &str, exe_name: Option<&str>) -> Option<String> {
-    if let Some(exe) = exe_name {
-        if !is_browser_exe(exe) {
-            return None;
+fn extract_domain_from_url(raw_url: &str) -> Option<String> {
+    let url = raw_url.trim();
+    let lower = url.to_ascii_lowercase();
+    let after_scheme = if lower.starts_with("https://") {
+        &url[8..]
+    } else if lower.starts_with("http://") {
+        &url[7..]
+    } else if lower.starts_with("www.") {
+        url
+    } else {
+        return None;
+    };
+
+    let host_port = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let host = host_port.split(':').next().unwrap_or("").to_lowercase();
+    let clean_host = host.strip_prefix("www.").unwrap_or(&host);
+    if clean_host.is_empty() || !clean_host.contains('.') {
+        return None;
+    }
+    Some(format!("site:{clean_host}"))
+}
+
+fn read_window_title(hwnd_raw: isize) -> Option<String> {
+    if hwnd_raw == 0 {
+        return None;
+    }
+    unsafe {
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd_raw as HWND, buf.as_mut_ptr(), buf.len() as i32);
+        if len > 0 {
+            let title = String::from_utf16_lossy(&buf[..len as usize]).trim().to_string();
+            if !title.is_empty() {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+fn infer_site_from_browser_title(title: &str) -> Option<String> {
+    let lower = title.to_lowercase();
+    let stripped = lower
+        .trim_end_matches(" - brave")
+        .trim_end_matches(" - google chrome")
+        .trim_end_matches(" - microsoft\u{200b} edge")
+        .trim_end_matches(" - microsoft edge")
+        .trim_end_matches(" - mozilla firefox")
+        .trim_end_matches(" - opera")
+        .trim_end_matches(" - vivaldi")
+        .trim();
+
+    if stripped.contains("facebook") {
+        return Some("site:facebook.com".to_string());
+    }
+    if stripped.contains("youtube") {
+        return Some("site:youtube.com".to_string());
+    }
+    if stripped.contains("github") {
+        return Some("site:github.com".to_string());
+    }
+    if stripped.contains("gmail") {
+        return Some("site:mail.google.com".to_string());
+    }
+    if stripped.contains("chatgpt") {
+        return Some("site:chatgpt.com".to_string());
+    }
+    if stripped.contains("reddit") {
+        return Some("site:reddit.com".to_string());
+    }
+    if stripped.contains("linkedin") {
+        return Some("site:linkedin.com".to_string());
+    }
+    if stripped.contains("twitter") || stripped.ends_with(" / x") || stripped.starts_with("x / ") {
+        return Some("site:x.com".to_string());
+    }
+    if stripped.contains("google") {
+        return Some("site:google.com".to_string());
+    }
+    None
+}
+
+fn extract_source_site(
+    raw_html: Option<&str>,
+    text_opt: Option<&str>,
+    exe_name: Option<&str>,
+    fg_hwnd: isize,
+) -> Option<String> {
+    let is_browser = exe_name.map(is_browser_exe).unwrap_or(false);
+
+    // 1. HTML Format SourceURL header (browser DOM copies)
+    if is_browser {
+        if let Some(html) = raw_html {
+            for line in html.lines().take(25) {
+                let trimmed = line.trim();
+                if trimmed.len() > 10 && trimmed[..10].eq_ignore_ascii_case("sourceurl:") {
+                    if let Some(site) = extract_domain_from_url(&trimmed[10..]) {
+                        return Some(site);
+                    }
+                }
+            }
         }
     }
 
-    for line in raw_html.lines().take(20) {
-        let trimmed = line.trim();
-        if let Some(url) = trimmed
-            .strip_prefix("SourceURL:")
-            .or_else(|| trimmed.strip_prefix("sourceurl:"))
-        {
-            let url = url.trim();
-            let after_scheme = url
-                .strip_prefix("https://")
-                .or_else(|| url.strip_prefix("http://"))?;
-            let host_port = after_scheme
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or("")
-                .trim();
-            let host = host_port.split(':').next().unwrap_or("").to_lowercase();
-            let clean_host = host.strip_prefix("www.").unwrap_or(&host);
-            if clean_host.is_empty() || !clean_host.contains('.') {
-                return None;
+    // 2. Copied URL / Link text itself (e.g. address bar or Copy Link Address)
+    if let Some(text) = text_opt {
+        let trimmed = text.trim();
+        if is_link(trimmed) {
+            if let Some(site) = extract_domain_from_url(trimmed) {
+                return Some(site);
             }
-            return Some(format!("site:{clean_host}"));
         }
     }
+
+    // 3. Browser tab window title fallback (e.g. plain-text copy inside input/textarea)
+    if is_browser {
+        if let Some(title) = read_window_title(fg_hwnd) {
+            if let Some(site) = infer_site_from_browser_title(&title) {
+                return Some(site);
+            }
+        }
+    }
+
     None
 }
 
@@ -1167,9 +1263,17 @@ fn process_payload(
         max_mb * 1024 * 1024
     };
 
-    let source_site = raw_html_opt.and_then(|raw| {
-        extract_source_site(raw, source_proc.as_ref().map(|(name, _)| name.as_str()))
-    });
+    let text_preview_opt = match &payload {
+        RawClipboardPayload::Text { text, .. } => text.as_deref(),
+        _ => None,
+    };
+
+    let source_site = extract_source_site(
+        raw_html_opt,
+        text_preview_opt,
+        source_proc.as_ref().map(|(name, _)| name.as_str()),
+        fg_hwnd,
+    );
 
     match payload {
         RawClipboardPayload::ImagePng { png_bytes, .. } => {
