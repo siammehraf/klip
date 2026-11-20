@@ -1,25 +1,38 @@
 mod db;
 
+use db::SettingEntry;
 use rusqlite::Connection;
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::ManagerExt;
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+use winreg::RegKey;
 
 const TRAY_ID: &str = "klip-tray";
-const ICON_TRAY_NORMAL: &[u8] = include_bytes!("../icons/tray.png");
-const ICON_TRAY_PAUSED: &[u8] = include_bytes!("../icons/tray-paused.png");
+
+const ICON_TRAY_DARK: &[u8] = include_bytes!("../icons/tray-dark.png");
+const ICON_TRAY_DARK_PAUSED: &[u8] = include_bytes!("../icons/tray-dark-paused.png");
+const ICON_TRAY_LIGHT: &[u8] = include_bytes!("../icons/tray-light.png");
+const ICON_TRAY_LIGHT_PAUSED: &[u8] = include_bytes!("../icons/tray-light-paused.png");
+
+const ICON_WIN_DARK: &[u8] = include_bytes!("../icons/128x128.png");
+const ICON_WIN_LIGHT: &[u8] = include_bytes!("../icons/icon-light.png");
 
 pub struct AppState {
     pub conn: Mutex<Connection>,
     pub db_path: PathBuf,
     pub images_dir: PathBuf,
     pub paused: Mutex<bool>,
+    pub theme: Mutex<String>,
     pub pause_menu_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    pub allow_exit: AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -29,12 +42,76 @@ pub struct Phase1Status {
     pub images_dir: String,
     pub tables: Vec<String>,
     pub paused: bool,
+    pub theme: String,
+    pub font_family: String,
+    pub settings: Vec<SettingEntry>,
 }
 
-fn show_main_window(app: &AppHandle) {
+fn select_tray_icon_bytes(theme: &str, paused: bool) -> &'static [u8] {
+    match (theme, paused) {
+        ("light", false) => ICON_TRAY_LIGHT,
+        ("light", true) => ICON_TRAY_LIGHT_PAUSED,
+        (_, false) => ICON_TRAY_DARK,
+        (_, true) => ICON_TRAY_DARK_PAUSED,
+    }
+}
+
+fn select_window_icon_bytes(theme: &str) -> &'static [u8] {
+    if theme == "light" {
+        ICON_WIN_LIGHT
+    } else {
+        ICON_WIN_DARK
+    }
+}
+
+fn sync_tray_visuals(app: &AppHandle, theme: &str, paused: bool) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if let Ok(img) = Image::from_bytes(select_tray_icon_bytes(theme, paused)) {
+            let _ = tray.set_icon(Some(img));
+        }
+        let tooltip = if paused {
+            "Klip \u{2014} Saving Paused"
+        } else {
+            "Klip \u{2014} Clipboard Manager"
+        };
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
+
+    if let Some(win) = app.get_webview_window("main") {
+        if let Ok(win_img) = Image::from_bytes(select_window_icon_bytes(theme)) {
+            let _ = win.set_icon(win_img);
+        }
+    }
+}
+
+fn open_or_focus_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
+        let _ = win.set_focus();
+        return;
+    }
+
+    let theme = {
+        let state = app.state::<AppState>();
+        state
+            .theme
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "dark".to_string())
+    };
+
+    if let Ok(win) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        .title("Klip")
+        .inner_size(960.0, 660.0)
+        .min_inner_size(720.0, 480.0)
+        .center()
+        .resizable(true)
+        .build()
+    {
+        if let Ok(win_img) = Image::from_bytes(select_window_icon_bytes(&theme)) {
+            let _ = win.set_icon(win_img);
+        }
         let _ = win.set_focus();
     }
 }
@@ -64,34 +141,101 @@ fn apply_pause_state(app: &AppHandle, state: &AppState, new_paused: bool) -> Res
         let _ = item.set_text(label);
     }
 
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let icon_bytes = if new_paused {
-            ICON_TRAY_PAUSED
-        } else {
-            ICON_TRAY_NORMAL
-        };
-        if let Ok(img) = Image::from_bytes(icon_bytes) {
-            let _ = tray.set_icon(Some(img));
-        }
-        let tooltip = if new_paused {
-            "Klip â€” Saving Paused"
-        } else {
-            "Klip â€” Clipboard Manager"
-        };
-        let _ = tray.set_tooltip(Some(tooltip));
-    }
+    let theme = state
+        .theme
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "dark".to_string());
+    sync_tray_visuals(app, &theme, new_paused);
 
     let _ = app.emit("klip://paused-changed", new_paused);
     Ok(())
 }
 
+fn clean_font_registry_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Strip format tags such as " (TrueType)", " (OpenType)", " (All res)"
+    let base = match trimmed.find(" (") {
+        Some(idx) => &trimmed[..idx],
+        None => trimmed,
+    };
+    let primary = base.split('&').next().unwrap_or(base).trim();
+    if primary.is_empty() || primary.starts_with('@') {
+        return None;
+    }
+
+    let mut clean = primary.to_string();
+    let suffixes = [
+        " Bold Italic",
+        " Bold Oblique",
+        " SemiBold Italic",
+        " Semibold Italic",
+        " Light Italic",
+        " Medium Italic",
+        " Regular",
+        " Bold",
+        " Italic",
+        " Oblique",
+    ];
+    for sfx in suffixes {
+        if clean.len() > sfx.len() && clean.ends_with(sfx) {
+            clean.truncate(clean.len() - sfx.len());
+            break;
+        }
+    }
+
+    let final_name = clean.trim().to_string();
+    if final_name.is_empty() {
+        None
+    } else {
+        Some(final_name)
+    }
+}
+
+#[tauri::command]
+fn list_installed_fonts() -> Vec<String> {
+    let mut set = BTreeSet::new();
+    set.insert("Segoe UI".to_string());
+    set.insert("Nirmala UI".to_string());
+
+    let subkey_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts";
+    let roots = [
+        RegKey::predef(HKEY_LOCAL_MACHINE),
+        RegKey::predef(HKEY_CURRENT_USER),
+    ];
+
+    for root in roots {
+        if let Ok(fonts_key) = root.open_subkey(subkey_path) {
+            for (name, _) in fonts_key.enum_values().flatten() {
+                if let Some(font_name) = clean_font_registry_name(&name) {
+                    set.insert(font_name);
+                }
+            }
+        }
+    }
+
+    set.into_iter().collect()
+}
+
 #[tauri::command]
 fn get_phase1_status(app: AppHandle, state: State<'_, AppState>) -> Result<Phase1Status, String> {
-    let tables = {
+    let (tables, settings, font_family) = {
         let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
-        db::list_tables(&conn)?
+        let tables = db::list_tables(&conn)?;
+        let settings = db::list_settings(&conn)?;
+        let font_family = db::get_setting(&conn, "font_family")?
+            .unwrap_or_else(|| "Segoe UI, Nirmala UI, sans-serif".to_string());
+        (tables, settings, font_family)
     };
     let paused = *state.paused.lock().map_err(|_| "Paused lock poisoned".to_string())?;
+    let theme = state
+        .theme
+        .lock()
+        .map_err(|_| "Theme lock poisoned".to_string())?
+        .clone();
 
     Ok(Phase1Status {
         version: app.package_info().version.to_string(),
@@ -99,6 +243,9 @@ fn get_phase1_status(app: AppHandle, state: State<'_, AppState>) -> Result<Phase
         images_dir: state.images_dir.to_string_lossy().into_owned(),
         tables,
         paused,
+        theme,
+        font_family,
+        settings,
     })
 }
 
@@ -112,15 +259,48 @@ fn toggle_pause(app: AppHandle, state: State<'_, AppState>) -> Result<bool, Stri
     Ok(next_paused)
 }
 
+#[tauri::command]
+fn set_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -> Result<String, String> {
+    let normalized = if theme == "light" { "light" } else { "dark" }.to_string();
+
+    {
+        let mut guard = state.theme.lock().map_err(|_| "Theme lock poisoned".to_string())?;
+        *guard = normalized.clone();
+    }
+    {
+        let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+        db::set_setting(&conn, "theme", &normalized)?;
+    }
+
+    let paused = *state.paused.lock().map_err(|_| "Paused lock poisoned".to_string())?;
+    sync_tray_visuals(&app, &normalized, paused);
+    let _ = app.emit("klip://theme-changed", normalized.clone());
+
+    Ok(normalized)
+}
+
+#[tauri::command]
+fn set_font_family(state: State<'_, AppState>, font_family: String) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    db::set_setting(&conn, "font_family", font_family.trim())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let storage = db::resolve_storage_paths().expect("Failed to resolve Klip storage paths");
     let conn = db::open_and_init(&storage.db_path).expect("Failed to initialize Klip SQLite DB");
+
     let initial_paused = db::get_setting(&conn, "paused")
         .ok()
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
+
+    let initial_theme = db::get_setting(&conn, "theme")
+        .ok()
+        .flatten()
+        .map(|v| if v == "light" { "light".to_string() } else { "dark".to_string() })
+        .unwrap_or_else(|| "dark".to_string());
 
     let initial_autostart_set = db::get_setting(&conn, "autostart_initialized")
         .ok()
@@ -132,27 +312,27 @@ pub fn run() {
         db_path: storage.db_path,
         images_dir: storage.images_dir,
         paused: Mutex::new(initial_paused),
+        theme: Mutex::new(initial_theme.clone()),
         pause_menu_item: Mutex::new(None),
+        allow_exit: AtomicBool::new(false),
     };
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main_window(app);
+            open_or_focus_main_window(app);
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
         .manage(app_state)
-        .invoke_handler(tauri::generate_handler![get_phase1_status, toggle_pause])
-        .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
-            }
-        })
+        .invoke_handler(tauri::generate_handler![
+            get_phase1_status,
+            toggle_pause,
+            set_theme,
+            set_font_family,
+            list_installed_fonts
+        ])
         .setup(move |app| {
             if !initial_autostart_set {
                 let _ = app.autolaunch().enable();
@@ -181,16 +361,11 @@ pub fn run() {
 
             let menu = Menu::with_items(app, &[&open_item, &pause_item, &sep, &quit_item])?;
 
-            let icon_bytes = if initial_paused {
-                ICON_TRAY_PAUSED
-            } else {
-                ICON_TRAY_NORMAL
-            };
-            let tray_icon = Image::from_bytes(icon_bytes)?;
+            let tray_icon = Image::from_bytes(select_tray_icon_bytes(&initial_theme, initial_paused))?;
             let tooltip = if initial_paused {
-                "Klip â€” Saving Paused"
+                "Klip \u{2014} Saving Paused"
             } else {
-                "Klip â€” Clipboard Manager"
+                "Klip \u{2014} Clipboard Manager"
             };
 
             TrayIconBuilder::with_id(TRAY_ID)
@@ -199,13 +374,17 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "open" => show_main_window(app),
+                    "open" => open_or_focus_main_window(app),
                     "pause" => {
                         let state = app.state::<AppState>();
                         let next_paused = state.paused.lock().map(|g| !*g).unwrap_or(false);
                         let _ = apply_pause_state(app, &state, next_paused);
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        let state = app.state::<AppState>();
+                        state.allow_exit.store(true, Ordering::SeqCst);
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -215,13 +394,22 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        show_main_window(tray.app_handle());
+                        open_or_focus_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Klip");
+        .build(tauri::generate_context!())
+        .expect("error while building Klip");
+
+    app.run(|app_handle, event| {
+        if let RunEvent::ExitRequested { api, .. } = event {
+            let state = app_handle.state::<AppState>();
+            if !state.allow_exit.load(Ordering::SeqCst) {
+                api.prevent_exit();
+            }
+        }
+    });
 }

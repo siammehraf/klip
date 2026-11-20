@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,9 +9,16 @@ pub struct StoragePaths {
     pub images_dir: PathBuf,
 }
 
+#[derive(Serialize)]
+pub struct SettingEntry {
+    pub key: String,
+    pub value: String,
+}
+
 pub fn resolve_storage_paths() -> Result<StoragePaths, String> {
-    let base_data = dirs::data_dir()
-        .ok_or_else(|| "Unable to locate Windows AppData Roaming directory".to_string())?;
+    let base_data = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "Unable to locate Windows APPDATA directory".to_string())?;
     let app_dir = base_data.join("Klip");
     let images_dir = app_dir.join("images");
     let db_path = app_dir.join("klip.db");
@@ -80,18 +88,27 @@ pub fn open_and_init(db_path: &Path) -> Result<Connection, String> {
     )
     .map_err(|e| format!("Failed initializing schema: {e}"))?;
 
+    let default_hotkeys = r#"{"toggle_popup":"Ctrl+Shift+Backquote","open_full_window":"Ctrl+Shift+K","toggle_pause":"Ctrl+Shift+P","paste_normal":"Enter","paste_plain":"Shift+Enter","pin_clip":"Ctrl+P","delete_clip":"Delete","focus_search":"Ctrl+F"}"#;
+
     let defaults = [
         ("hotkey", "Ctrl+Shift+Backquote"),
+        ("hotkeys_json", default_hotkeys),
         ("theme", "dark"),
         ("font_family", "Segoe UI, Nirmala UI, sans-serif"),
+        ("popup_position", "mouse"),
+        ("popup_last_x", ""),
+        ("popup_last_y", ""),
         ("paste_mode", "auto_paste"),
         ("autostart", "true"),
+        ("collection_limit", "1000"),
         ("retention_days", "30"),
         ("max_clip_size_mb", "10"),
         ("excluded_apps", "[]"),
         ("history_locked", "false"),
         ("paused", "false"),
         ("backup_folder", ""),
+        ("backup_format", "sqlite"),
+        ("backup_schedule", "off"),
         ("last_backup_prompt_date", ""),
     ];
 
@@ -136,6 +153,27 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), Stri
     )
     .map_err(|e| format!("Failed saving setting {key}: {e}"))?;
     Ok(())
+}
+
+pub fn list_settings(conn: &Connection) -> Result<Vec<SettingEntry>, String> {
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM settings ORDER BY key")
+        .map_err(|e| format!("Failed listing settings: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SettingEntry {
+                key: row.get(0)?,
+                value: row.get(1)?,
+            })
+        })
+        .map_err(|e| format!("Failed querying settings: {e}"))?;
+
+    let mut entries = Vec::new();
+    for item in rows {
+        entries.push(item.map_err(|e| format!("Failed reading setting entry: {e}"))?);
+    }
+    Ok(entries)
 }
 
 pub fn list_tables(conn: &Connection) -> Result<Vec<String>, String> {
