@@ -1,7 +1,7 @@
 mod clipboard;
 mod db;
 
-use clipboard::{normalize_exe_name, ClipboardWatcherHandle};
+use clipboard::{normalize_exe_name, write_clip_to_clipboard, ClipboardWatcherHandle};
 use db::{ClipItem, SettingEntry};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -308,6 +308,20 @@ fn list_clips(
 }
 
 #[tauri::command]
+fn copy_clip(
+    state: State<'_, AppState>,
+    clip_id: i64,
+    plain_only: Option<bool>,
+) -> Result<(), String> {
+    let item = {
+        let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+        db::get_clip_by_id(&conn, clip_id)?
+            .ok_or_else(|| "Clip not found".to_string())?
+    };
+    write_clip_to_clipboard(&item, plain_only.unwrap_or(false))
+}
+
+#[tauri::command]
 fn toggle_pin_clip(state: State<'_, AppState>, clip_id: i64) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
     db::toggle_pin(&conn, clip_id)
@@ -415,6 +429,7 @@ pub fn run() {
             set_font_family,
             list_installed_fonts,
             list_clips,
+            copy_clip,
             toggle_pin_clip,
             delete_clip,
             get_excluded_apps,

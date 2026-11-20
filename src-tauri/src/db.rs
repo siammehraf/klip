@@ -27,6 +27,7 @@ pub struct ClipItem {
     pub content_size: i64,
     pub source_app: Option<String>,
     pub source_icon_path: Option<String>,
+    pub source_site: Option<String>,
     pub is_pinned: bool,
     pub created_at: i64,
 }
@@ -39,6 +40,7 @@ pub struct NewClip<'a> {
     pub content_size: i64,
     pub source_app: Option<&'a str>,
     pub source_icon_path: Option<&'a str>,
+    pub source_site: Option<&'a str>,
     pub created_at: i64,
 }
 
@@ -71,6 +73,32 @@ pub fn resolve_storage_paths() -> Result<StoragePaths, String> {
     })
 }
 
+fn ensure_column_exists(conn: &Connection, table: &str, column: &str, col_def: &str) -> Result<(), String> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .map_err(|e| format!("Failed inspecting {table}: {e}"))?;
+    let cols = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| format!("Failed reading {table} columns: {e}"))?;
+
+    let mut found = false;
+    for col in cols.flatten() {
+        if col == column {
+            found = true;
+            break;
+        }
+    }
+    drop(stmt);
+
+    if !found {
+        let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {col_def}");
+        conn.execute(&alter, [])
+            .map_err(|e| format!("Failed adding {column} to {table}: {e}"))?;
+    }
+    Ok(())
+}
+
 pub fn open_and_init(db_path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed opening SQLite DB: {e}"))?;
 
@@ -89,6 +117,7 @@ pub fn open_and_init(db_path: &Path) -> Result<Connection, String> {
             content_size INTEGER NOT NULL DEFAULT 0,
             source_app TEXT,
             source_icon_path TEXT,
+            source_site TEXT,
             is_pinned INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL
         );
@@ -125,6 +154,9 @@ pub fn open_and_init(db_path: &Path) -> Result<Connection, String> {
         ",
     )
     .map_err(|e| format!("Failed initializing schema: {e}"))?;
+
+    // Safe migration for Phase 1/2 databases
+    ensure_column_exists(&conn, "clips", "source_site", "TEXT")?;
 
     let default_hotkeys = r#"{"toggle_popup":"Ctrl+Shift+Backquote","open_full_window":"Ctrl+Shift+K","toggle_pause":"Ctrl+Shift+P","paste_normal":"Enter","paste_plain":"Shift+Enter","pin_clip":"Ctrl+P","delete_clip":"Delete","focus_search":"Ctrl+F"}"#;
 
@@ -234,8 +266,8 @@ pub fn insert_clip(conn: &Connection, clip: &NewClip<'_>) -> Result<ClipItem, St
     conn.execute(
         "INSERT INTO clips (
             clip_type, text_content, html_content, image_path,
-            content_size, source_app, source_icon_path, is_pinned, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+            content_size, source_app, source_icon_path, source_site, is_pinned, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
         params![
             clip.clip_type,
             clip.text_content,
@@ -244,6 +276,7 @@ pub fn insert_clip(conn: &Connection, clip: &NewClip<'_>) -> Result<ClipItem, St
             clip.content_size,
             clip.source_app,
             clip.source_icon_path,
+            clip.source_site,
             clip.created_at
         ],
     )
@@ -259,9 +292,44 @@ pub fn insert_clip(conn: &Connection, clip: &NewClip<'_>) -> Result<ClipItem, St
         content_size: clip.content_size,
         source_app: clip.source_app.map(|s| s.to_string()),
         source_icon_path: clip.source_icon_path.map(|s| s.to_string()),
+        source_site: clip.source_site.map(|s| s.to_string()),
         is_pinned: false,
         created_at: clip.created_at,
     })
+}
+
+pub fn get_clip_by_id(conn: &Connection, clip_id: i64) -> Result<Option<ClipItem>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
+                    source_app, source_icon_path, source_site, is_pinned, created_at
+             FROM clips WHERE id = ?1",
+        )
+        .map_err(|e| format!("Failed preparing get_clip_by_id: {e}"))?;
+
+    let mut rows = stmt
+        .query_map(params![clip_id], |row| {
+            Ok(ClipItem {
+                id: row.get(0)?,
+                clip_type: row.get(1)?,
+                text_content: row.get(2)?,
+                html_content: row.get(3)?,
+                image_path: row.get(4)?,
+                content_size: row.get(5)?,
+                source_app: row.get(6)?,
+                source_icon_path: row.get(7)?,
+                source_site: row.get(8)?,
+                is_pinned: row.get::<_, i64>(9)? != 0,
+                created_at: row.get(10)?,
+            })
+        })
+        .map_err(|e| format!("Failed querying clip {clip_id}: {e}"))?;
+
+    if let Some(res) = rows.next() {
+        Ok(Some(res.map_err(|e| format!("Failed decoding clip: {e}"))?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn escape_like_pattern(input: &str) -> String {
@@ -293,7 +361,7 @@ pub fn list_clips(
 
     let mut sql = String::from(
         "SELECT id, clip_type, text_content, html_content, image_path, content_size,
-                source_app, source_icon_path, is_pinned, created_at
+                source_app, source_icon_path, source_site, is_pinned, created_at
          FROM clips
          WHERE 1=1",
     );
@@ -306,7 +374,7 @@ pub fn list_clips(
     for (idx, pattern) in terms.iter().enumerate() {
         let p_num = idx + 1;
         sql.push_str(&format!(
-            " AND (COALESCE(text_content, '') LIKE ?{p_num} ESCAPE '\\' OR COALESCE(source_app, '') LIKE ?{p_num} ESCAPE '\\' OR clip_type LIKE ?{p_num} ESCAPE '\\')"
+            " AND (COALESCE(text_content, '') LIKE ?{p_num} ESCAPE '\\' OR COALESCE(source_app, '') LIKE ?{p_num} ESCAPE '\\' OR COALESCE(source_site, '') LIKE ?{p_num} ESCAPE '\\' OR clip_type LIKE ?{p_num} ESCAPE '\\')"
         ));
         bind_values.push(Value::Text(pattern.clone()));
     }
@@ -332,8 +400,9 @@ pub fn list_clips(
                 content_size: row.get(5)?,
                 source_app: row.get(6)?,
                 source_icon_path: row.get(7)?,
-                is_pinned: row.get::<_, i64>(8)? != 0,
-                created_at: row.get(9)?,
+                source_site: row.get(8)?,
+                is_pinned: row.get::<_, i64>(9)? != 0,
+                created_at: row.get(10)?,
             })
         })
         .map_err(|e| format!("Failed querying clips: {e}"))?;

@@ -1,14 +1,14 @@
 use crate::db::{self, ClipItem, NewClip};
 use crate::AppState;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
-use std::io::BufWriter;
+use std::io::{BufWriter, Cursor};
 use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
-use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::ptr::{copy_nonoverlapping, null, null_mut};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -20,12 +20,14 @@ use windows_sys::Win32::Graphics::Gdi::{
     BITMAPINFOHEADER, BI_BITFIELDS, BI_RGB, DIB_RGB_COLORS,
 };
 use windows_sys::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, GetClipboardData, GetClipboardOwner,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
-    RemoveClipboardFormatListener,
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
+    GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows_sys::Win32::System::Memory::{
+    GlobalAlloc, GlobalFree, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -46,7 +48,9 @@ const CF_DIBV5: u32 = 17;
 const WM_CLIPBOARDUPDATE: u32 = 0x031D;
 const WS_EX_TOOLWINDOW_FLAG: u32 = 0x0000_0080;
 const WS_EX_NOACTIVATE_FLAG: u32 = 0x0800_0000;
+const GMEM_MOVEABLE_FLAG: u32 = 0x0002;
 
+pub static IGNORE_SELF_COPY: AtomicBool = AtomicBool::new(false);
 static IMAGE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 struct FormatIds {
@@ -60,18 +64,23 @@ struct FormatIds {
 enum RawClipboardPayload {
     ImagePng {
         png_bytes: Vec<u8>,
-        source_proc: Option<(String, PathBuf)>,
+        raw_html: Option<String>,
+        fg_hwnd: isize,
+        owner_hwnd: isize,
         created_at: i64,
     },
     ImageDib {
         dib_bytes: Vec<u8>,
-        source_proc: Option<(String, PathBuf)>,
+        raw_html: Option<String>,
+        fg_hwnd: isize,
+        owner_hwnd: isize,
         created_at: i64,
     },
     Text {
         text: Option<String>,
-        html: Option<String>,
-        source_proc: Option<(String, PathBuf)>,
+        raw_html: Option<String>,
+        fg_hwnd: isize,
+        owner_hwnd: isize,
         created_at: i64,
     },
 }
@@ -114,12 +123,12 @@ struct ClipboardLock;
 
 impl ClipboardLock {
     fn acquire(hwnd: HWND) -> Option<Self> {
-        for _ in 0..5 {
+        for _ in 0..4 {
             let ok = unsafe { OpenClipboard(hwnd) };
             if ok != 0 {
                 return Some(Self);
             }
-            thread::sleep(Duration::from_millis(8));
+            thread::sleep(Duration::from_millis(5));
         }
         None
     }
@@ -149,6 +158,178 @@ unsafe fn read_global_bytes(handle: HANDLE) -> Option<Vec<u8>> {
     let data = slice.to_vec();
     GlobalUnlock(handle);
     Some(data)
+}
+
+unsafe fn alloc_and_set_clipboard(format: u32, bytes: &[u8]) -> Result<(), String> {
+    let hmem = GlobalAlloc(GMEM_MOVEABLE_FLAG, bytes.len());
+    if hmem.is_null() {
+        return Err("GlobalAlloc failed".to_string());
+    }
+    let ptr = GlobalLock(hmem) as *mut u8;
+    if ptr.is_null() {
+        GlobalFree(hmem);
+        return Err("GlobalLock failed".to_string());
+    }
+    copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+    GlobalUnlock(hmem);
+
+    if SetClipboardData(format, hmem).is_null() {
+        GlobalFree(hmem);
+        return Err("SetClipboardData failed".to_string());
+    }
+    Ok(())
+}
+
+pub fn write_clip_to_clipboard(item: &ClipItem, plain_only: bool) -> Result<(), String> {
+    let _lock = ClipboardLock::acquire(null_mut())
+        .ok_or_else(|| "Windows clipboard is busy".to_string())?;
+
+    if item.clip_type == "image" {
+        let img_path = item
+            .image_path
+            .as_deref()
+            .ok_or_else(|| "Missing image path".to_string())?;
+        let png_bytes = fs::read(img_path).map_err(|e| format!("Failed reading image: {e}"))?;
+        let dib_bytes = png_to_dib(&png_bytes)?;
+        let png_fmt = register_format("PNG");
+
+        IGNORE_SELF_COPY.store(true, Ordering::SeqCst);
+        unsafe {
+            if EmptyClipboard() == 0 {
+                IGNORE_SELF_COPY.store(false, Ordering::SeqCst);
+                return Err("EmptyClipboard failed".to_string());
+            }
+            if let Err(e) = alloc_and_set_clipboard(CF_DIB, &dib_bytes) {
+                IGNORE_SELF_COPY.store(false, Ordering::SeqCst);
+                return Err(e);
+            }
+            if png_fmt != 0 {
+                let _ = alloc_and_set_clipboard(png_fmt, &png_bytes);
+            }
+        }
+        return Ok(());
+    }
+
+    let text = item.text_content.as_deref().unwrap_or("");
+    let wide = to_wide_null(text);
+    let byte_len = wide.len() * 2;
+    let utf16_bytes = unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, byte_len) };
+
+    IGNORE_SELF_COPY.store(true, Ordering::SeqCst);
+    unsafe {
+        if EmptyClipboard() == 0 {
+            IGNORE_SELF_COPY.store(false, Ordering::SeqCst);
+            return Err("EmptyClipboard failed".to_string());
+        }
+        if let Err(e) = alloc_and_set_clipboard(CF_UNICODETEXT, utf16_bytes) {
+            IGNORE_SELF_COPY.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+
+        if !plain_only {
+            if let Some(html_frag) = item.html_content.as_deref() {
+                if !html_frag.is_empty() {
+                    let html_fmt = register_format("HTML Format");
+                    if html_fmt != 0 {
+                        let cf_html = wrap_cf_html(html_frag);
+                        let mut cf_bytes = cf_html.into_bytes();
+                        cf_bytes.push(0);
+                        let _ = alloc_and_set_clipboard(html_fmt, &cf_bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn wrap_cf_html(fragment: &str) -> String {
+    let prefix = "Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000000000\r\nStartFragment:0000000141\r\nEndFragment:0000000000\r\n<html><body>\r\n<!--StartFragment-->";
+    let suffix = "<!--EndFragment-->\r\n</body></html>";
+    let full = format!("{prefix}{fragment}{suffix}");
+    let start_html = full.find("<html>").unwrap_or(105);
+    let end_html = full.len();
+    let start_frag = full.find("<!--StartFragment-->").map(|i| i + 20).unwrap_or(start_html);
+    let end_frag = full.find("<!--EndFragment-->").unwrap_or(end_html);
+    format!(
+        "Version:0.9\r\nStartHTML:{start_html:010}\r\nEndHTML:{end_html:010}\r\nStartFragment:{start_frag:010}\r\nEndFragment:{end_frag:010}\r\n<html><body>\r\n<!--StartFragment-->{fragment}<!--EndFragment-->\r\n</body></html>"
+    )
+}
+
+fn png_to_dib(png_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("PNG decode header error: {e}"))?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("PNG decode frame error: {e}"))?;
+    let samples = &buf[..info.buffer_size()];
+
+    let w = info.width as i32;
+    let h = info.height as i32;
+    let row_bytes = (info.width as usize) * 4;
+    let mut dib = Vec::with_capacity(40 + row_bytes * (info.height as usize));
+
+    // BITMAPINFOHEADER (40 bytes, bottom-up BGRA)
+    dib.extend_from_slice(&40u32.to_le_bytes());
+    dib.extend_from_slice(&w.to_le_bytes());
+    dib.extend_from_slice(&h.to_le_bytes());
+    dib.extend_from_slice(&1u16.to_le_bytes());
+    dib.extend_from_slice(&32u16.to_le_bytes());
+    dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    dib.extend_from_slice(&((row_bytes * info.height as usize) as u32).to_le_bytes());
+    dib.extend_from_slice(&0i32.to_le_bytes());
+    dib.extend_from_slice(&0i32.to_le_bytes());
+    dib.extend_from_slice(&0u32.to_le_bytes());
+    dib.extend_from_slice(&0u32.to_le_bytes());
+
+    let src_bpp = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
+        _ => return Err("Unsupported PNG color type".into()),
+    };
+
+    for y in (0..info.height as usize).rev() {
+        let row = &samples[y * (info.width as usize) * src_bpp..(y + 1) * (info.width as usize) * src_bpp];
+        for x in 0..info.width as usize {
+            let s = x * src_bpp;
+            match info.color_type {
+                png::ColorType::Rgba => {
+                    dib.push(row[s + 2]);
+                    dib.push(row[s + 1]);
+                    dib.push(row[s]);
+                    dib.push(row[s + 3]);
+                }
+                png::ColorType::Rgb => {
+                    dib.push(row[s + 2]);
+                    dib.push(row[s + 1]);
+                    dib.push(row[s]);
+                    dib.push(255);
+                }
+                png::ColorType::GrayscaleAlpha => {
+                    dib.push(row[s]);
+                    dib.push(row[s]);
+                    dib.push(row[s]);
+                    dib.push(row[s + 1]);
+                }
+                png::ColorType::Grayscale => {
+                    dib.push(row[s]);
+                    dib.push(row[s]);
+                    dib.push(row[s]);
+                    dib.push(255);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(dib)
 }
 
 fn is_privacy_blocked(formats: &FormatIds) -> bool {
@@ -232,63 +413,59 @@ unsafe fn query_process_image(pid: u32) -> Option<(String, PathBuf)> {
     Some((exe_name, path))
 }
 
-fn get_source_app_info() -> Option<(String, PathBuf)> {
+fn resolve_source_from_hwnds(fg_raw: isize, owner_raw: isize) -> Option<(String, PathBuf)> {
     unsafe {
-        let mut hwnd = GetForegroundWindow();
-        if hwnd.is_null() {
-            hwnd = GetClipboardOwner();
-        }
-        if hwnd.is_null() {
+        let primary = if fg_raw != 0 {
+            fg_raw as HWND
+        } else {
+            owner_raw as HWND
+        };
+        if primary.is_null() {
             return None;
         }
 
         let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid == 0 {
-            return None;
-        }
-
-        let mut cls = [0u16; 128];
-        let cls_len = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
-        let cls_name = if cls_len > 0 {
-            String::from_utf16_lossy(&cls[..cls_len as usize])
-        } else {
-            String::new()
-        };
-
-        // Windows 11 UWP / Packaged apps (e.g. Notepad, Settings) host CoreWindow inside ApplicationFrameWindow
-        if cls_name == "ApplicationFrameWindow" {
-            let mut search = ChildAppSearch {
-                host_pid: pid,
-                core_pid: 0,
-                any_other_pid: 0,
-            };
-            EnumChildWindows(
-                hwnd,
-                Some(enum_frame_child_proc),
-                &mut search as *mut _ as LPARAM,
-            );
-            let real_pid = if search.core_pid != 0 {
-                search.core_pid
-            } else if search.any_other_pid != 0 {
-                search.any_other_pid
+        GetWindowThreadProcessId(primary, &mut pid);
+        if pid != 0 {
+            let mut cls = [0u16; 128];
+            let cls_len = GetClassNameW(primary, cls.as_mut_ptr(), cls.len() as i32);
+            let cls_name = if cls_len > 0 {
+                String::from_utf16_lossy(&cls[..cls_len as usize])
             } else {
-                pid
+                String::new()
             };
-            if let Some(info) = query_process_image(real_pid) {
+
+            if cls_name == "ApplicationFrameWindow" {
+                let mut search = ChildAppSearch {
+                    host_pid: pid,
+                    core_pid: 0,
+                    any_other_pid: 0,
+                };
+                EnumChildWindows(
+                    primary,
+                    Some(enum_frame_child_proc),
+                    &mut search as *mut _ as LPARAM,
+                );
+                let real_pid = if search.core_pid != 0 {
+                    search.core_pid
+                } else if search.any_other_pid != 0 {
+                    search.any_other_pid
+                } else {
+                    pid
+                };
+                if let Some(info) = query_process_image(real_pid) {
+                    return Some(info);
+                }
+            }
+
+            if let Some(info) = query_process_image(pid) {
                 return Some(info);
             }
         }
 
-        if let Some(info) = query_process_image(pid) {
-            return Some(info);
-        }
-
-        // Last resort: check clipboard owner if foreground query failed
-        let owner = GetClipboardOwner();
-        if !owner.is_null() && owner != hwnd {
+        if owner_raw != 0 && owner_raw != fg_raw {
             let mut owner_pid: u32 = 0;
-            GetWindowThreadProcessId(owner, &mut owner_pid);
+            GetWindowThreadProcessId(owner_raw as HWND, &mut owner_pid);
             return query_process_image(owner_pid);
         }
 
@@ -315,6 +492,55 @@ fn is_app_excluded(excluded_list: &[String], exe_name: &str) -> bool {
         let e_stem = e.strip_suffix(".exe").unwrap_or(&e);
         e == target || e_stem == target_stem
     })
+}
+
+fn is_browser_exe(exe_name: &str) -> bool {
+    matches!(
+        normalize_exe_name(exe_name).as_str(),
+        "brave.exe"
+            | "chrome.exe"
+            | "msedge.exe"
+            | "firefox.exe"
+            | "opera.exe"
+            | "vivaldi.exe"
+            | "arc.exe"
+            | "zen.exe"
+            | "waterfox.exe"
+            | "floorp.exe"
+    )
+}
+
+fn extract_source_site(raw_html: &str, exe_name: Option<&str>) -> Option<String> {
+    if let Some(exe) = exe_name {
+        if !is_browser_exe(exe) {
+            return None;
+        }
+    }
+
+    for line in raw_html.lines().take(20) {
+        let trimmed = line.trim();
+        if let Some(url) = trimmed
+            .strip_prefix("SourceURL:")
+            .or_else(|| trimmed.strip_prefix("sourceurl:"))
+        {
+            let url = url.trim();
+            let after_scheme = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))?;
+            let host_port = after_scheme
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            let host = host_port.split(':').next().unwrap_or("").to_lowercase();
+            let clean_host = host.strip_prefix("www.").unwrap_or(&host);
+            if clean_host.is_empty() || !clean_host.contains('.') {
+                return None;
+            }
+            return Some(format!("site:{clean_host}"));
+        }
+    }
+    None
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -350,18 +576,25 @@ fn ensure_app_icon(
     exe_name: &str,
     exe_path: &Path,
     icons_dir: &Path,
-    cache: &mut HashSet<String>,
+    cache: &mut HashMap<String, Option<String>>,
 ) -> Option<String> {
-    let file_name = format!("{}.png", sanitize_filename(&exe_name.to_lowercase()));
+    let key = normalize_exe_name(exe_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
+    let file_name = format!("{}.png", sanitize_filename(&key));
     let dest_path = icons_dir.join(&file_name);
     let dest_str = dest_path.to_string_lossy().into_owned();
 
-    if cache.contains(&file_name) || dest_path.exists() {
-        cache.insert(file_name);
+    if dest_path.exists() {
+        cache.insert(key, Some(dest_str.clone()));
         return Some(dest_str);
     }
 
     let wide_path = to_wide_null(&exe_path.to_string_lossy());
+    let mut extracted_path: Option<String> = None;
+
     unsafe {
         let mut shfi: SHFILEINFOW = zeroed();
         let res = SHGetFileInfoW(
@@ -379,28 +612,26 @@ fn ensure_app_icon(
 
         if hicon.is_null() {
             let mut large_icon: HICON = null_mut();
-            let extracted = ExtractIconExW(wide_path.as_ptr(), 0, &mut large_icon, null_mut(), 1);
-            if extracted > 0 && !large_icon.is_null() {
+            let count = ExtractIconExW(wide_path.as_ptr(), 0, &mut large_icon, null_mut(), 1);
+            if count > 0 && !large_icon.is_null() {
                 hicon = large_icon;
             }
         }
 
-        if hicon.is_null() {
-            return None;
-        }
+        if !hicon.is_null() {
+            let png_bytes = hicon_to_png(hicon);
+            DestroyIcon(hicon);
 
-        let png_bytes = hicon_to_png(hicon);
-        DestroyIcon(hicon);
-
-        if let Ok(bytes) = png_bytes {
-            if fs::write(&dest_path, bytes).is_ok() {
-                cache.insert(file_name);
-                return Some(dest_str);
+            if let Ok(bytes) = png_bytes {
+                if fs::write(&dest_path, bytes).is_ok() {
+                    extracted_path = Some(dest_str);
+                }
             }
         }
     }
 
-    None
+    cache.insert(key, extracted_path.clone());
+    extracted_path
 }
 
 unsafe fn hicon_to_png(hicon: HICON) -> Result<Vec<u8>, String> {
@@ -763,7 +994,7 @@ fn extract_cf_html_fragment(raw: &str) -> String {
     raw.trim().to_string()
 }
 
-fn read_html_format(html_format_id: u32) -> Option<String> {
+fn read_raw_html_format(html_format_id: u32) -> Option<String> {
     if html_format_id == 0 {
         return None;
     }
@@ -774,12 +1005,11 @@ fn read_html_format(html_format_id: u32) -> Option<String> {
         let h = GetClipboardData(html_format_id);
         let bytes = read_global_bytes(h)?;
         let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        let raw = String::from_utf8_lossy(&bytes[..nul_pos]);
-        let frag = extract_cf_html_fragment(&raw);
-        if frag.is_empty() {
+        let raw = String::from_utf8_lossy(&bytes[..nul_pos]).into_owned();
+        if raw.trim().is_empty() {
             None
         } else {
-            Some(frag)
+            Some(raw)
         }
     }
 }
@@ -881,9 +1111,43 @@ fn detect_text_clip_type(text: &str, has_html: bool) -> &'static str {
 fn process_payload(
     app: &AppHandle,
     payload: RawClipboardPayload,
-    cached_icons: &mut HashSet<String>,
+    cached_icons: &mut HashMap<String, Option<String>>,
 ) {
     let state = app.state::<AppState>();
+
+    let (fg_hwnd, owner_hwnd, raw_html_opt, created_at) = match &payload {
+        RawClipboardPayload::ImagePng {
+            raw_html,
+            fg_hwnd,
+            owner_hwnd,
+            created_at,
+            ..
+        } => (*fg_hwnd, *owner_hwnd, raw_html.as_deref(), *created_at),
+        RawClipboardPayload::ImageDib {
+            raw_html,
+            fg_hwnd,
+            owner_hwnd,
+            created_at,
+            ..
+        } => (*fg_hwnd, *owner_hwnd, raw_html.as_deref(), *created_at),
+        RawClipboardPayload::Text {
+            raw_html,
+            fg_hwnd,
+            owner_hwnd,
+            created_at,
+            ..
+        } => (*fg_hwnd, *owner_hwnd, raw_html.as_deref(), *created_at),
+    };
+
+    // Resolve process info & check exclusions completely off the Win32 listener thread
+    let source_proc = resolve_source_from_hwnds(fg_hwnd, owner_hwnd);
+    if let Some((ref exe_name, _)) = source_proc {
+        if let Ok(excluded) = state.excluded_apps_cache.read() {
+            if is_app_excluded(&excluded, exe_name) {
+                return;
+            }
+        }
+    }
 
     let max_bytes: usize = {
         let Ok(conn) = state.conn.lock() else {
@@ -898,12 +1162,12 @@ fn process_payload(
         max_mb * 1024 * 1024
     };
 
+    let source_site = raw_html_opt.and_then(|raw| {
+        extract_source_site(raw, source_proc.as_ref().map(|(name, _)| name.as_str()))
+    });
+
     match payload {
-        RawClipboardPayload::ImagePng {
-            png_bytes,
-            source_proc,
-            created_at,
-        } => {
+        RawClipboardPayload::ImagePng { png_bytes, .. } => {
             if let Some((w, h)) = read_png_dimensions(&png_bytes) {
                 save_image_clip(
                     app,
@@ -912,17 +1176,14 @@ fn process_payload(
                     w,
                     h,
                     source_proc,
+                    source_site.as_deref(),
                     created_at,
                     max_bytes,
                     cached_icons,
                 );
             }
         }
-        RawClipboardPayload::ImageDib {
-            dib_bytes,
-            source_proc,
-            created_at,
-        } => {
+        RawClipboardPayload::ImageDib { dib_bytes, .. } => {
             if let Ok((png_bytes, w, h)) = dib_to_png(&dib_bytes) {
                 save_image_clip(
                     app,
@@ -931,20 +1192,21 @@ fn process_payload(
                     w,
                     h,
                     source_proc,
+                    source_site.as_deref(),
                     created_at,
                     max_bytes,
                     cached_icons,
                 );
             }
         }
-        RawClipboardPayload::Text {
-            text,
-            html,
-            source_proc,
-            created_at,
-        } => {
+        RawClipboardPayload::Text { text, raw_html, .. } => {
+            let html_frag = raw_html
+                .as_deref()
+                .map(extract_cf_html_fragment)
+                .filter(|f| !f.is_empty());
+
             let text_bytes = text.as_ref().map(|s| s.len()).unwrap_or(0);
-            let html_bytes = html.as_ref().map(|s| s.len()).unwrap_or(0);
+            let html_bytes = html_frag.as_ref().map(|s| s.len()).unwrap_or(0);
             let total_size = text_bytes + html_bytes;
 
             if total_size == 0 || total_size > max_bytes {
@@ -952,7 +1214,7 @@ fn process_payload(
             }
 
             let clip_type = match text.as_deref() {
-                Some(t) => detect_text_clip_type(t, html.is_some()),
+                Some(t) => detect_text_clip_type(t, html_frag.is_some()),
                 None => "rich_text",
             };
 
@@ -976,11 +1238,12 @@ fn process_payload(
                     &NewClip {
                         clip_type,
                         text_content: text.as_deref(),
-                        html_content: html.as_deref(),
+                        html_content: html_frag.as_deref(),
                         image_path: None,
                         content_size: total_size as i64,
                         source_app: source_app.as_deref(),
                         source_icon_path: source_icon_path.as_deref(),
+                        source_site: source_site.as_deref(),
                         created_at,
                     },
                 )?;
@@ -1006,9 +1269,10 @@ fn save_image_clip(
     w: u32,
     h: u32,
     source_proc: Option<(String, PathBuf)>,
+    source_site: Option<&str>,
     created_at: i64,
     max_bytes: usize,
-    cached_icons: &mut HashSet<String>,
+    cached_icons: &mut HashMap<String, Option<String>>,
 ) {
     if png_bytes.is_empty() || png_bytes.len() > max_bytes {
         return;
@@ -1048,6 +1312,7 @@ fn save_image_clip(
                 content_size: png_bytes.len() as i64,
                 source_app: source_app.as_deref(),
                 source_icon_path: source_icon_path.as_deref(),
+                source_site,
                 created_at,
             },
         )?;
@@ -1064,26 +1329,20 @@ fn save_image_clip(
 }
 
 fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
-    let state = ctx.app.state::<AppState>();
+    // Ignore copies triggered programmatically by Klip itself
+    if IGNORE_SELF_COPY.swap(false, Ordering::SeqCst) {
+        return;
+    }
 
-    // Fast lock-free pause check
+    let state = ctx.app.state::<AppState>();
     if state.paused_flag.load(Ordering::Relaxed) {
         return;
     }
 
-    // Resolve foreground/UWP app before touching the clipboard
-    let source_proc = get_source_app_info();
-    if let Some((ref exe_name, _)) = source_proc {
-        if let Ok(excluded) = state.excluded_apps_cache.read() {
-            if is_app_excluded(&excluded, exe_name) {
-                return;
-            }
-        }
-    }
-
+    // Grab lightweight window handles only; process/icon/domain work happens in worker thread
+    let (fg_hwnd, owner_hwnd) = unsafe { (GetForegroundWindow() as isize, GetClipboardOwner() as isize) };
     let created_at = db::now_unix_ms();
 
-    // Acquire clipboard ONLY long enough to copy raw bytes, then CloseClipboard immediately
     let payload: Option<RawClipboardPayload> = {
         let _lock = match ClipboardLock::acquire(hwnd) {
             Some(l) => l,
@@ -1100,22 +1359,26 @@ fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
             return;
         }
 
+        let raw_html = read_raw_html_format(ctx.formats.html);
+
         unsafe {
             if ctx.formats.png != 0 && IsClipboardFormatAvailable(ctx.formats.png) != 0 {
-                if let Some(png_bytes) = read_global_bytes(GetClipboardData(ctx.formats.png)) {
-                    Some(RawClipboardPayload::ImagePng {
+                read_global_bytes(GetClipboardData(ctx.formats.png)).map(|png_bytes| {
+                    RawClipboardPayload::ImagePng {
                         png_bytes,
-                        source_proc,
+                        raw_html,
+                        fg_hwnd,
+                        owner_hwnd,
                         created_at,
-                    })
-                } else {
-                    None
-                }
+                    }
+                })
             } else if IsClipboardFormatAvailable(CF_DIBV5) != 0 {
                 read_global_bytes(GetClipboardData(CF_DIBV5)).map(|dib_bytes| {
                     RawClipboardPayload::ImageDib {
                         dib_bytes,
-                        source_proc,
+                        raw_html,
+                        fg_hwnd,
+                        owner_hwnd,
                         created_at,
                     }
                 })
@@ -1123,18 +1386,20 @@ fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
                 read_global_bytes(GetClipboardData(CF_DIB)).map(|dib_bytes| {
                     RawClipboardPayload::ImageDib {
                         dib_bytes,
-                        source_proc,
+                        raw_html,
+                        fg_hwnd,
+                        owner_hwnd,
                         created_at,
                     }
                 })
             } else {
                 let text = read_unicode_text();
-                let html = read_html_format(ctx.formats.html);
-                if text.is_some() || html.is_some() {
+                if text.is_some() || raw_html.is_some() {
                     Some(RawClipboardPayload::Text {
                         text,
-                        html,
-                        source_proc,
+                        raw_html,
+                        fg_hwnd,
+                        owner_hwnd,
                         created_at,
                     })
                 } else {
@@ -1142,7 +1407,7 @@ fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
                 }
             }
         }
-    }; // _lock drops here -> CloseClipboard() runs immediately before any PNG/SQLite work
+    }; // _lock drops here -> CloseClipboard() immediately
 
     if let Some(p) = payload {
         if let Some(tx) = ctx.worker_tx.as_ref() {
@@ -1187,7 +1452,7 @@ pub fn start_clipboard_listener(app: AppHandle) -> ClipboardWatcherHandle {
     thread::Builder::new()
         .name("klip-capture-worker".to_string())
         .spawn(move || {
-            let mut cached_icons = HashSet::new();
+            let mut cached_icons: HashMap<String, Option<String>> = HashMap::new();
             while let Ok(payload) = rx.recv() {
                 process_payload(&worker_app, payload, &mut cached_icons);
             }
@@ -1251,6 +1516,7 @@ pub fn start_clipboard_listener(app: AppHandle) -> ClipboardWatcherHandle {
                 return;
             }
 
+            // Strictly blocking GetMessageW loop (0.00% idle CPU)
             let mut msg = zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
                 TranslateMessage(&msg);
