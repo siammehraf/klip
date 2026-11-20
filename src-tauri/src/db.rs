@@ -8,7 +8,7 @@ pub struct StoragePaths {
     pub app_dir: PathBuf,
     pub db_path: PathBuf,
     pub images_dir: PathBuf,
-    pub app_icons_dir: PathBuf,
+    pub icons_dir: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -57,19 +57,18 @@ pub fn resolve_storage_paths() -> Result<StoragePaths, String> {
         .ok_or_else(|| "Unable to locate Windows APPDATA directory".to_string())?;
     let app_dir = base_data.join("Klip");
     let images_dir = app_dir.join("images");
-    let app_icons_dir = app_dir.join("app_icons");
+    let icons_dir = app_dir.join("icons");
     let db_path = app_dir.join("klip.db");
 
     fs::create_dir_all(&app_dir).map_err(|e| format!("Failed creating Klip dir: {e}"))?;
     fs::create_dir_all(&images_dir).map_err(|e| format!("Failed creating images dir: {e}"))?;
-    fs::create_dir_all(&app_icons_dir)
-        .map_err(|e| format!("Failed creating app_icons dir: {e}"))?;
+    fs::create_dir_all(&icons_dir).map_err(|e| format!("Failed creating icons dir: {e}"))?;
 
     Ok(StoragePaths {
         app_dir,
         db_path,
         images_dir,
-        app_icons_dir,
+        icons_dir,
     })
 }
 
@@ -155,7 +154,6 @@ pub fn open_and_init(db_path: &Path) -> Result<Connection, String> {
     )
     .map_err(|e| format!("Failed initializing schema: {e}"))?;
 
-    // Safe migration for Phase 1/2 databases
     ensure_column_exists(&conn, "clips", "source_site", "TEXT")?;
 
     let default_hotkeys = r#"{"toggle_popup":"Ctrl+Shift+Backquote","open_full_window":"Ctrl+Shift+K","toggle_pause":"Ctrl+Shift+P","paste_normal":"Enter","paste_plain":"Shift+Enter","pin_clip":"Ctrl+P","delete_clip":"Delete","focus_search":"Ctrl+F"}"#;

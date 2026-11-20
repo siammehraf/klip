@@ -80,10 +80,31 @@ export function siteDisplayName(domain: string): string {
   if (matchSite(domain, "wikipedia.org")) return "Wikipedia";
   if (matchSite(domain, "figma.com")) return "Figma";
   if (matchSite(domain, "vercel.com")) return "Vercel";
+  if (matchSite(domain, "tracker.gg")) return "Tracker.gg";
+  if (matchSite(domain, "torrentbd.net")) return "TorrentBD";
   return domain;
 }
 
-function KnownSiteIcon({ domain }: { domain: string }) {
+const MONOGRAM_COLORS = [
+  "#2563eb",
+  "#7c3aed",
+  "#0d9488",
+  "#d97706",
+  "#db2777",
+  "#059669",
+  "#dc2626",
+  "#4f46e5"
+];
+
+function domainColor(domain: string): string {
+  let hash = 0;
+  for (let i = 0; i < domain.length; i++) {
+    hash = (hash * 31 + domain.charCodeAt(i)) >>> 0;
+  }
+  return MONOGRAM_COLORS[hash % MONOGRAM_COLORS.length];
+}
+
+function SiteGlyph({ domain }: { domain: string }) {
   if (matchSite(domain, "facebook.com")) {
     return (
       <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#1877F2] text-white">
@@ -159,6 +180,25 @@ function KnownSiteIcon({ domain }: { domain: string }) {
       </span>
     );
   }
+  if (matchSite(domain, "instagram.com")) {
+    return (
+      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#E4405F] text-white">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
+          <rect x="4" y="4" width="16" height="16" rx="4" />
+          <circle cx="12" cy="12" r="3.5" />
+        </svg>
+      </span>
+    );
+  }
+  if (matchSite(domain, "whatsapp.com")) {
+    return (
+      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#25D366] text-white">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
+          <path d="M21 11.5a8.5 8.5 0 01-12.5 7.5L4 20l1.1-4.3A8.5 8.5 0 1121 11.5z" />
+        </svg>
+      </span>
+    );
+  }
   if (matchSite(domain, "claude.ai")) {
     return (
       <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#D97757] text-[9px] font-bold text-white">
@@ -203,13 +243,6 @@ function KnownSiteIcon({ domain }: { domain: string }) {
       </span>
     );
   }
-  if (matchSite(domain, "whatsapp.com")) {
-    return (
-      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#25D366] text-[9px] font-bold text-white">
-        W
-      </span>
-    );
-  }
   if (matchSite(domain, "telegram.org") || domain === "t.me") {
     return (
       <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#26A5E4] text-[9px] font-bold text-white">
@@ -217,44 +250,25 @@ function KnownSiteIcon({ domain }: { domain: string }) {
       </span>
     );
   }
-  if (matchSite(domain, "instagram.com")) {
+  if (matchSite(domain, "tracker.gg")) {
     return (
-      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#E4405F] text-[9px] font-bold text-white">
-        Ig
+      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#E11D48] text-[9px] font-bold text-white">
+        TR
       </span>
     );
   }
-  if (matchSite(domain, "netflix.com")) {
-    return (
-      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#E50914] text-[10px] font-bold text-white">
-        N
-      </span>
-    );
-  }
-  if (matchSite(domain, "wikipedia.org")) {
-    return (
-      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-zinc-200 text-[9px] font-serif font-bold text-zinc-900">
-        W
-      </span>
-    );
-  }
-  if (matchSite(domain, "figma.com")) {
-    return (
-      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-[#A259FF] text-[9px] font-bold text-white">
-        F
-      </span>
-    );
-  }
-  if (matchSite(domain, "vercel.com")) {
-    return (
-      <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-black border border-zinc-700 text-white">
-        <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M12 4l9 16H3z" />
-        </svg>
-      </span>
-    );
-  }
-  return null;
+
+  // Colored monogram badge for any other website
+  const label = siteDisplayName(domain);
+  const initial = (label[0] ?? "W").toUpperCase();
+  return (
+    <span
+      className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-[9px] font-bold text-white"
+      style={{ backgroundColor: domainColor(domain) }}
+    >
+      {initial}
+    </span>
+  );
 }
 
 export function ClipSourceBadge({
@@ -268,33 +282,9 @@ export function ClipSourceBadge({
 }) {
   if (clip.source_site) {
     const domain = cleanDomain(clip.source_site);
-    const known = KnownSiteIcon({ domain });
-
     return (
       <span className="flex min-w-0 items-center gap-1.5">
-        {known ? (
-          known
-        ) : clip.source_icon_path ? (
-          <img
-            src={convertFileSrc(clip.source_icon_path)}
-            alt=""
-            className="h-4 w-4 shrink-0 rounded-sm object-contain"
-          />
-        ) : (
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            className="shrink-0 text-zinc-400"
-            aria-hidden="true"
-          >
-            <circle cx="12" cy="12" r="9" />
-            <path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" />
-          </svg>
-        )}
+        <SiteGlyph domain={domain} />
         <span className="truncate font-medium">{siteDisplayName(domain)}</span>
         {!compact && (
           <>
@@ -308,7 +298,16 @@ export function ClipSourceBadge({
               {clip.source_site}
             </span>
             {clip.source_app && (
-              <span className="text-[11px] text-zinc-500">via {clip.source_app}</span>
+              <span className="flex items-center gap-1 text-[11px] text-zinc-500">
+                {clip.source_icon_path && (
+                  <img
+                    src={convertFileSrc(clip.source_icon_path)}
+                    alt=""
+                    className="h-3.5 w-3.5 rounded-sm object-contain opacity-80"
+                  />
+                )}
+                via {clip.source_app}
+              </span>
             )}
           </>
         )}

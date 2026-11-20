@@ -11,6 +11,8 @@ import {
 interface Phase1Status {
   version: string;
   paused: boolean;
+  hotkey: string;
+  hotkey_registered: boolean;
 }
 
 function formatTime(ts: number): string {
@@ -24,6 +26,8 @@ function formatTime(ts: number): string {
 export default function App() {
   const [paused, setPaused] = useState(false);
   const [version, setVersion] = useState("0.1.0");
+  const [hotkey, setHotkey] = useState("Ctrl+Shift+Backquote");
+  const [hotkeyOk, setHotkeyOk] = useState(true);
   const [excludedCount, setExcludedCount] = useState(0);
   const [clips, setClips] = useState<ClipItem[]>([]);
   const [search, setSearch] = useState("");
@@ -53,6 +57,8 @@ export default function App() {
       .then(([status, excluded, initialClips]) => {
         setPaused(status.paused);
         setVersion(status.version);
+        setHotkey(status.hotkey);
+        setHotkeyOk(status.hotkey_registered);
         setExcludedCount(excluded.length);
         setClips(initialClips);
       })
@@ -60,6 +66,10 @@ export default function App() {
 
     const unlistenPause = listen<boolean>("klip://paused-changed", (event) => {
       setPaused(event.payload);
+    });
+
+    const unlistenHotkey = listen<boolean>("klip://hotkey-status", (event) => {
+      setHotkeyOk(event.payload);
     });
 
     const unlistenAdded = listen<ClipItem>("klip://clip-added", (event) => {
@@ -90,6 +100,7 @@ export default function App() {
 
     return () => {
       unlistenPause.then((fn) => fn());
+      unlistenHotkey.then((fn) => fn());
       unlistenAdded.then((fn) => fn());
       unlistenDeleted.then((fn) => fn());
       unlistenPinned.then((fn) => fn());
@@ -108,6 +119,10 @@ export default function App() {
     } catch (err) {
       setError(String(err));
     }
+  };
+
+  const handleOpenPopup = async () => {
+    await invoke("open_quick_popup");
   };
 
   const handleCopy = async (clipId: number) => {
@@ -144,9 +159,11 @@ export default function App() {
     }
   };
 
+  const displayHotkey = hotkey.replace("Backquote", "~");
+
   return (
     <div className="flex h-full flex-col bg-[#0e1015] text-zinc-100">
-      <header className="flex items-center justify-between gap-3 border-b border-zinc-800/80 px-5 py-3">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800/80 px-5 py-3">
         <div className="flex items-center gap-2.5">
           <div className="flex h-7 w-7 items-center justify-center rounded-md border border-zinc-700/70 bg-zinc-900">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -160,16 +177,29 @@ export default function App() {
             </svg>
           </div>
           <h1 className="text-sm font-semibold tracking-tight">
-            Klip{" "}
-            <span className="font-normal text-zinc-500">
-              v{version} {"\u2014"} Phase 3 (Popup Hotkey: Ctrl+Shift+~)
-            </span>
+            Klip <span className="font-normal text-zinc-500">v{version}</span>
           </h1>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={`rounded-md border px-2.5 py-1 text-[11px] ${
+              hotkeyOk
+                ? "border-zinc-800 bg-zinc-900/80 text-zinc-300"
+                : "border-red-800/70 bg-red-950/40 text-red-300"
+            }`}
+          >
+            Hotkey {displayHotkey}: {hotkeyOk ? "Active" : "Conflict (in use by another app)"}
+          </span>
+          <button
+            type="button"
+            onClick={handleOpenPopup}
+            className="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+          >
+            Quick Popup
+          </button>
           <span className="rounded-md border border-zinc-800 bg-zinc-900/80 px-2.5 py-1 text-[11px] text-zinc-400">
-            {excludedCount} excluded {excludedCount === 1 ? "app" : "apps"}
+            {excludedCount} excluded
           </span>
           <button
             type="button"
@@ -220,7 +250,7 @@ export default function App() {
           <div className="mx-auto mt-12 max-w-md rounded-xl border border-zinc-800 bg-[#14171f] p-6 text-center">
             <p className="text-sm font-medium">No matching clips</p>
             <p className="mt-1.5 text-xs text-zinc-400">
-              Press Ctrl + Shift + ~ anywhere to open the Quick Popup, or copy text/images to see them captured here.
+              Press {displayHotkey} anywhere to open the Quick Popup, or copy text/images to see them captured here.
             </p>
           </div>
         ) : (

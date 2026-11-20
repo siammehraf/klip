@@ -1,10 +1,11 @@
 mod clipboard;
 mod db;
+mod icon_extractor;
 mod popup;
 
 use clipboard::{normalize_exe_name, write_clip_to_clipboard, ClipboardWatcherHandle};
 use db::{ClipItem, SettingEntry};
-use popup::paste_clip_to_previous_window;
+use popup::{paste_clip_to_previous_window, toggle_popup_window};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -16,6 +17,7 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
+use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winreg::RegKey;
 
@@ -33,7 +35,7 @@ pub struct AppState {
     pub conn: Mutex<Connection>,
     pub db_path: PathBuf,
     pub images_dir: PathBuf,
-    pub app_icons_dir: PathBuf,
+    pub icons_dir: PathBuf,
     pub paused: Mutex<bool>,
     pub paused_flag: Arc<AtomicBool>,
     pub excluded_apps_cache: Arc<RwLock<Vec<String>>>,
@@ -43,7 +45,9 @@ pub struct AppState {
     pub watcher: Mutex<Option<ClipboardWatcherHandle>>,
     pub popup_prev_hwnd: AtomicIsize,
     pub popup_keep_open: AtomicBool,
+    pub popup_has_focused: AtomicBool,
     pub popup_opened_at_ms: AtomicI64,
+    pub hotkey_registered: AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -55,6 +59,8 @@ pub struct Phase1Status {
     pub paused: bool,
     pub theme: String,
     pub font_family: String,
+    pub hotkey: String,
+    pub hotkey_registered: bool,
     pub settings: Vec<SettingEntry>,
 }
 
@@ -242,13 +248,15 @@ fn list_installed_fonts() -> Vec<String> {
 
 #[tauri::command]
 fn get_phase1_status(app: AppHandle, state: State<'_, AppState>) -> Result<Phase1Status, String> {
-    let (tables, settings, font_family) = {
+    let (tables, settings, font_family, hotkey) = {
         let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
         let tables = db::list_tables(&conn)?;
         let settings = db::list_settings(&conn)?;
         let font_family = db::get_setting(&conn, "font_family")?
             .unwrap_or_else(|| "Segoe UI, Nirmala UI, sans-serif".to_string());
-        (tables, settings, font_family)
+        let hotkey = db::get_setting(&conn, "hotkey")?
+            .unwrap_or_else(|| "Ctrl+Shift+Backquote".to_string());
+        (tables, settings, font_family, hotkey)
     };
     let paused = *state.paused.lock().map_err(|_| "Paused lock poisoned".to_string())?;
     let theme = state
@@ -256,6 +264,7 @@ fn get_phase1_status(app: AppHandle, state: State<'_, AppState>) -> Result<Phase
         .lock()
         .map(|g| g.clone())
         .unwrap_or_else(|_| "dark".to_string());
+    let hotkey_registered = state.hotkey_registered.load(Ordering::SeqCst);
 
     Ok(Phase1Status {
         version: app.package_info().version.to_string(),
@@ -265,6 +274,8 @@ fn get_phase1_status(app: AppHandle, state: State<'_, AppState>) -> Result<Phase
         paused,
         theme,
         font_family,
+        hotkey,
+        hotkey_registered,
         settings,
     })
 }
@@ -326,6 +337,27 @@ fn set_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -> Resul
 fn set_font_family(state: State<'_, AppState>, font_family: String) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
     db::set_setting(&conn, "font_family", font_family.trim())
+}
+
+#[tauri::command]
+fn set_popup_hotkey(app: AppHandle, state: State<'_, AppState>, hotkey: String) -> Result<(), String> {
+    {
+        let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+        db::set_setting(&conn, "hotkey", hotkey.trim())?;
+    }
+    if let Ok(guard) = state.watcher.lock() {
+        if let Some(handle) = guard.as_ref() {
+            handle.reload_hotkey();
+        }
+    }
+    let _ = app;
+    Ok(())
+}
+
+#[tauri::command]
+fn open_quick_popup(app: AppHandle) {
+    let fg = unsafe { GetForegroundWindow() as isize };
+    toggle_popup_window(&app, fg);
 }
 
 #[tauri::command]
@@ -480,7 +512,7 @@ pub fn run() {
         conn: Mutex::new(conn),
         db_path: storage.db_path,
         images_dir: storage.images_dir.clone(),
-        app_icons_dir: storage.app_icons_dir.clone(),
+        icons_dir: storage.icons_dir.clone(),
         paused: Mutex::new(initial_paused),
         paused_flag: Arc::new(AtomicBool::new(initial_paused)),
         excluded_apps_cache: Arc::new(RwLock::new(initial_excluded)),
@@ -490,7 +522,9 @@ pub fn run() {
         watcher: Mutex::new(None),
         popup_prev_hwnd: AtomicIsize::new(0),
         popup_keep_open: AtomicBool::new(false),
+        popup_has_focused: AtomicBool::new(false),
         popup_opened_at_ms: AtomicI64::new(0),
+        hotkey_registered: AtomicBool::new(false),
     };
 
     let app = tauri::Builder::default()
@@ -505,13 +539,17 @@ pub fn run() {
         .on_window_event(|window, event| {
             if window.label() == "popup" {
                 match event {
+                    WindowEvent::Focused(true) => {
+                        let state = window.app_handle().state::<AppState>();
+                        state.popup_has_focused.store(true, Ordering::SeqCst);
+                    }
                     WindowEvent::Focused(false) => {
                         let app_handle = window.app_handle();
                         let state = app_handle.state::<AppState>();
                         let keep_open = state.popup_keep_open.load(Ordering::SeqCst);
-                        let opened_at = state.popup_opened_at_ms.load(Ordering::SeqCst);
-                        let elapsed = db::now_unix_ms() - opened_at;
-                        if !keep_open && elapsed > 180 {
+                        let has_focused = state.popup_has_focused.load(Ordering::SeqCst);
+                        let elapsed = db::now_unix_ms() - state.popup_opened_at_ms.load(Ordering::SeqCst);
+                        if has_focused && !keep_open && elapsed > 250 {
                             let _ = window.close();
                         }
                     }
@@ -533,6 +571,8 @@ pub fn run() {
             toggle_pause,
             set_theme,
             set_font_family,
+            set_popup_hotkey,
+            open_quick_popup,
             list_installed_fonts,
             list_clips,
             copy_clip,
@@ -546,8 +586,9 @@ pub fn run() {
         ])
         .setup(move |app| {
             let scope = app.asset_protocol_scope();
+            let _ = scope.allow_directory(&storage.app_dir, true);
             let _ = scope.allow_directory(&storage.images_dir, true);
-            let _ = scope.allow_directory(&storage.app_icons_dir, true);
+            let _ = scope.allow_directory(&storage.icons_dir, true);
 
             if !initial_autostart_set {
                 let _ = app.autolaunch().enable();
@@ -558,6 +599,7 @@ pub fn run() {
             }
 
             let open_item = MenuItem::with_id(app, "open", "Open Klip", true, None::<&str>)?;
+            let popup_item = MenuItem::with_id(app, "popup", "Quick Popup", true, None::<&str>)?;
             let pause_label = if initial_paused {
                 "Resume Saving"
             } else {
@@ -574,7 +616,7 @@ pub fn run() {
                 };
             }
 
-            let menu = Menu::with_items(app, &[&open_item, &pause_item, &sep, &quit_item])?;
+            let menu = Menu::with_items(app, &[&open_item, &popup_item, &pause_item, &sep, &quit_item])?;
 
             let tray_icon =
                 Image::from_bytes(select_tray_icon_bytes(&initial_theme, initial_paused))?;
@@ -591,6 +633,10 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => open_or_focus_main_window(app),
+                    "popup" => {
+                        let fg = unsafe { GetForegroundWindow() as isize };
+                        toggle_popup_window(app, fg);
+                    }
                     "pause" => {
                         let state = app.state::<AppState>();
                         let next_paused = state.paused.lock().map(|g| !*g).unwrap_or(false);

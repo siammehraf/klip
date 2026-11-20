@@ -30,6 +30,7 @@ credentials.json
 *.sqlite3
 /backups/
 /images/
+/icons/
 /app_icons/
 /exports/
 klip-backup*

@@ -1,13 +1,14 @@
 use crate::db::{self, ClipItem, NewClip};
+use crate::icon_extractor::{encode_rgba_png, ensure_app_icon, resolve_source_from_hwnds};
 use crate::popup::{parse_hotkey_string, toggle_popup_window, HOTKEY_POPUP_ID};
 use crate::AppState;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
-use std::io::{BufWriter, Cursor};
+use std::io::Cursor;
 use std::mem::{size_of, zeroed};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr::{copy_nonoverlapping, null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -15,32 +16,21 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
-use windows_sys::Win32::Foundation::{BOOL, CloseHandle, FALSE, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
-    BITMAPINFOHEADER, BI_BITFIELDS, BI_RGB, DIB_RGB_COLORS,
-};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{BI_BITFIELDS, BI_RGB};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
     GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
-};
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
-use windows_sys::Win32::UI::Shell::{
-    ExtractIconExW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, GetClassNameW, GetForegroundWindow, GetIconInfo, GetMessageW,
-    GetWindowTextW, GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW,
-    TranslateMessage, HICON, HWND_MESSAGE, ICONINFO, WM_CLOSE, WM_DESTROY, WNDCLASSEXW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+    GetMessageW, GetWindowTextW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    TranslateMessage, HWND_MESSAGE, WM_CLOSE, WM_DESTROY, WNDCLASSEXW,
 };
 
 #[link(name = "kernel32")]
@@ -379,121 +369,6 @@ fn is_privacy_blocked(formats: &FormatIds) -> bool {
     false
 }
 
-struct ChildAppSearch {
-    host_pid: u32,
-    core_pid: u32,
-    any_other_pid: u32,
-}
-
-unsafe extern "system" fn enum_frame_child_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let search = &mut *(lparam as *mut ChildAppSearch);
-    let mut pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    if pid != 0 && pid != search.host_pid {
-        let mut cls = [0u16; 128];
-        let len = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
-        if len > 0 {
-            let name = String::from_utf16_lossy(&cls[..len as usize]);
-            if name == "Windows.UI.Core.CoreWindow" {
-                search.core_pid = pid;
-                return 0;
-            }
-        }
-        if search.any_other_pid == 0 {
-            search.any_other_pid = pid;
-        }
-    }
-    1
-}
-
-unsafe fn query_process_image(pid: u32) -> Option<(String, PathBuf)> {
-    if pid == 0 {
-        return None;
-    }
-    let proc_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if proc_handle.is_null() {
-        return None;
-    }
-
-    let mut buf = vec![0u16; 1024];
-    let mut len = buf.len() as u32;
-    let ok = QueryFullProcessImageNameW(proc_handle, 0, buf.as_mut_ptr(), &mut len);
-    CloseHandle(proc_handle);
-
-    if ok == 0 || len == 0 {
-        return None;
-    }
-
-    let full_path = String::from_utf16_lossy(&buf[..len as usize]);
-    let path = PathBuf::from(&full_path);
-    let exe_name = path.file_name()?.to_str()?.trim().to_string();
-    if exe_name.is_empty() {
-        return None;
-    }
-
-    Some((exe_name, path))
-}
-
-fn resolve_source_from_hwnds(fg_raw: isize, owner_raw: isize) -> Option<(String, PathBuf)> {
-    unsafe {
-        let primary = if fg_raw != 0 {
-            fg_raw as HWND
-        } else {
-            owner_raw as HWND
-        };
-        if primary.is_null() {
-            return None;
-        }
-
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(primary, &mut pid);
-        if pid != 0 {
-            let mut cls = [0u16; 128];
-            let cls_len = GetClassNameW(primary, cls.as_mut_ptr(), cls.len() as i32);
-            let cls_name = if cls_len > 0 {
-                String::from_utf16_lossy(&cls[..cls_len as usize])
-            } else {
-                String::new()
-            };
-
-            if cls_name == "ApplicationFrameWindow" {
-                let mut search = ChildAppSearch {
-                    host_pid: pid,
-                    core_pid: 0,
-                    any_other_pid: 0,
-                };
-                EnumChildWindows(
-                    primary,
-                    Some(enum_frame_child_proc),
-                    &mut search as *mut _ as LPARAM,
-                );
-                let real_pid = if search.core_pid != 0 {
-                    search.core_pid
-                } else if search.any_other_pid != 0 {
-                    search.any_other_pid
-                } else {
-                    pid
-                };
-                if let Some(info) = query_process_image(real_pid) {
-                    return Some(info);
-                }
-            }
-
-            if let Some(info) = query_process_image(pid) {
-                return Some(info);
-            }
-        }
-
-        if owner_raw != 0 && owner_raw != fg_raw {
-            let mut owner_pid: u32 = 0;
-            GetWindowThreadProcessId(owner_raw as HWND, &mut owner_pid);
-            return query_process_image(owner_pid);
-        }
-
-        None
-    }
-}
-
 pub fn normalize_exe_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
@@ -576,57 +451,119 @@ fn read_window_title(hwnd_raw: isize) -> Option<String> {
     None
 }
 
-fn infer_site_from_browser_title(title: &str) -> Option<String> {
-    let lower = title.to_lowercase();
-    let stripped = lower
-        .trim_end_matches(" - brave")
-        .trim_end_matches(" - google chrome")
-        .trim_end_matches(" - microsoft\u{200b} edge")
-        .trim_end_matches(" - microsoft edge")
-        .trim_end_matches(" - mozilla firefox")
-        .trim_end_matches(" - opera")
-        .trim_end_matches(" - vivaldi")
-        .trim();
+fn strip_leading_notification_count(s: &str) -> &str {
+    let t = s.trim_start();
+    if let Some(after_open) = t.strip_prefix('(') {
+        if let Some(close_idx) = after_open.find(')') {
+            let inner = &after_open[..close_idx];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit() || c == '+') {
+                return after_open[close_idx + 1..].trim_start();
+            }
+        }
+    }
+    t
+}
 
-    if stripped.contains("facebook") {
+fn strip_browser_suffix(title: &str) -> String {
+    let mut s = title.trim().to_string();
+    let suffixes = [
+        " - Brave",
+        " - Google Chrome",
+        " - Microsoft\u{200b} Edge",
+        " - Microsoft Edge",
+        " \u{2014} Mozilla Firefox",
+        " - Mozilla Firefox",
+        " - Opera",
+        " - Vivaldi",
+        " - Arc",
+        " - Zen Browser",
+    ];
+    for sfx in suffixes {
+        if s.len() > sfx.len() && s[s.len() - sfx.len()..].eq_ignore_ascii_case(sfx) {
+            s.truncate(s.len() - sfx.len());
+            break;
+        }
+    }
+    strip_leading_notification_count(&s).trim().to_string()
+}
+
+fn infer_site_from_browser_title(title: &str) -> Option<String> {
+    let cleaned = strip_browser_suffix(title);
+    let lower = cleaned.to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+
+    if lower.contains("facebook") {
         return Some("site:facebook.com".to_string());
     }
-    if stripped.contains("youtube") {
+    if lower.contains("youtube") {
         return Some("site:youtube.com".to_string());
     }
-    if stripped.contains("github") {
+    if lower.contains("github") {
         return Some("site:github.com".to_string());
     }
-    if stripped.contains("gmail") {
+    if lower.contains("gmail") || lower.contains("mail.google") {
         return Some("site:mail.google.com".to_string());
     }
-    if stripped.contains("chatgpt") {
+    if lower.contains("chatgpt") {
         return Some("site:chatgpt.com".to_string());
     }
-    if stripped.contains("claude") {
+    if lower.contains("claude") {
         return Some("site:claude.ai".to_string());
     }
-    if stripped.contains("todoist") {
+    if lower.contains("whatsapp") {
+        return Some("site:whatsapp.com".to_string());
+    }
+    if lower.contains("instagram") {
+        return Some("site:instagram.com".to_string());
+    }
+    if lower.contains("todoist") {
         return Some("site:todoist.com".to_string());
     }
-    if stripped.contains("discord") {
+    if lower.contains("discord") {
         return Some("site:discord.com".to_string());
     }
-    if stripped.contains("notion") {
+    if lower.contains("notion") {
         return Some("site:notion.so".to_string());
     }
-    if stripped.contains("reddit") {
+    if lower.contains("reddit") {
         return Some("site:reddit.com".to_string());
     }
-    if stripped.contains("linkedin") {
+    if lower.contains("linkedin") {
         return Some("site:linkedin.com".to_string());
     }
-    if stripped.contains("twitter") || stripped.ends_with(" / x") || stripped.starts_with("x / ") {
+    if lower.contains("tracker.gg") || lower.contains("tracker network") {
+        return Some("site:tracker.gg".to_string());
+    }
+    if lower.contains("torrentbd") {
+        return Some("site:torrentbd.net".to_string());
+    }
+    if lower.contains("stack overflow") || lower.contains("stackoverflow") {
+        return Some("site:stackoverflow.com".to_string());
+    }
+    if lower.contains("twitch") {
+        return Some("site:twitch.tv".to_string());
+    }
+    if lower.contains("twitter") || lower.ends_with(" / x") || lower.starts_with("x / ") || lower == "x" {
         return Some("site:x.com".to_string());
     }
-    if stripped.contains("google") {
+    if lower.contains("google") {
         return Some("site:google.com".to_string());
     }
+
+    // Check if the cleaned tab title explicitly contains a domain (e.g. "Page - example.com")
+    for token in lower.split(|c: char| c.is_whitespace() || c == '|' || c == '/') {
+        let t = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+        if t.contains('.') && !t.starts_with('.') && !t.ends_with('.') && t.len() <= 64 {
+            let parts: Vec<&str> = t.split('.').collect();
+            if parts.len() >= 2 && parts.last().map(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())).unwrap_or(false) {
+                let host = t.strip_prefix("www.").unwrap_or(t);
+                return Some(format!("site:{host}"));
+            }
+        }
+    }
+
     None
 }
 
@@ -669,200 +606,6 @@ fn extract_source_site(
     }
 
     None
-}
-
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    {
-        let bw = BufWriter::new(&mut out);
-        let mut encoder = png::Encoder::new(bw, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| format!("PNG header error: {e}"))?;
-        writer
-            .write_image_data(rgba)
-            .map_err(|e| format!("PNG write error: {e}"))?;
-    }
-    Ok(out)
-}
-
-fn ensure_app_icon(
-    exe_name: &str,
-    exe_path: &Path,
-    icons_dir: &Path,
-    cache: &mut HashMap<String, Option<String>>,
-) -> Option<String> {
-    let key = normalize_exe_name(exe_name);
-    if let Some(cached) = cache.get(&key) {
-        return cached.clone();
-    }
-
-    let file_name = format!("{}.png", sanitize_filename(&key));
-    let dest_path = icons_dir.join(&file_name);
-    let dest_str = dest_path.to_string_lossy().into_owned();
-
-    if dest_path.exists() {
-        cache.insert(key, Some(dest_str.clone()));
-        return Some(dest_str);
-    }
-
-    let wide_path = to_wide_null(&exe_path.to_string_lossy());
-    let mut extracted_path: Option<String> = None;
-
-    unsafe {
-        let mut shfi: SHFILEINFOW = zeroed();
-        let res = SHGetFileInfoW(
-            wide_path.as_ptr(),
-            0,
-            &mut shfi,
-            size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
-        );
-        let mut hicon = if res != 0 && !shfi.hIcon.is_null() {
-            shfi.hIcon
-        } else {
-            null_mut()
-        };
-
-        if hicon.is_null() {
-            let mut large_icon: HICON = null_mut();
-            let count = ExtractIconExW(wide_path.as_ptr(), 0, &mut large_icon, null_mut(), 1);
-            if count > 0 && !large_icon.is_null() {
-                hicon = large_icon;
-            }
-        }
-
-        if !hicon.is_null() {
-            let png_bytes = hicon_to_png(hicon);
-            DestroyIcon(hicon);
-
-            if let Ok(bytes) = png_bytes {
-                if fs::write(&dest_path, bytes).is_ok() {
-                    extracted_path = Some(dest_str);
-                }
-            }
-        }
-    }
-
-    cache.insert(key, extracted_path.clone());
-    extracted_path
-}
-
-unsafe fn hicon_to_png(hicon: HICON) -> Result<Vec<u8>, String> {
-    let mut icon_info: ICONINFO = zeroed();
-    if GetIconInfo(hicon, &mut icon_info) == 0 {
-        return Err("GetIconInfo failed".into());
-    }
-
-    let cleanup = |info: &ICONINFO| {
-        if !info.hbmColor.is_null() {
-            DeleteObject(info.hbmColor as _);
-        }
-        if !info.hbmMask.is_null() {
-            DeleteObject(info.hbmMask as _);
-        }
-    };
-
-    if icon_info.hbmColor.is_null() {
-        cleanup(&icon_info);
-        return Err("No color bitmap in HICON".into());
-    }
-
-    let mut bmp: BITMAP = zeroed();
-    if GetObjectW(
-        icon_info.hbmColor as _,
-        size_of::<BITMAP>() as i32,
-        &mut bmp as *mut _ as *mut c_void,
-    ) == 0
-    {
-        cleanup(&icon_info);
-        return Err("GetObjectW failed".into());
-    }
-
-    let w = bmp.bmWidth;
-    let h = bmp.bmHeight.abs();
-    if w <= 0 || h <= 0 || w > 512 || h > 512 {
-        cleanup(&icon_info);
-        return Err("Invalid icon dimensions".into());
-    }
-
-    let hdc = CreateCompatibleDC(null_mut());
-    if hdc.is_null() {
-        cleanup(&icon_info);
-        return Err("CreateCompatibleDC failed".into());
-    }
-
-    let mut bmi: BITMAPINFO = zeroed();
-    bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    let mut bgra = vec![0u8; (w * h * 4) as usize];
-    let lines = GetDIBits(
-        hdc,
-        icon_info.hbmColor,
-        0,
-        h as u32,
-        bgra.as_mut_ptr() as *mut c_void,
-        &mut bmi,
-        DIB_RGB_COLORS,
-    );
-
-    let mut has_alpha = false;
-    for px in bgra.chunks_exact_mut(4) {
-        px.swap(0, 2);
-        if px[3] != 0 {
-            has_alpha = true;
-        }
-    }
-
-    if !has_alpha && !icon_info.hbmMask.is_null() {
-        let mut mask_bgra = vec![0u8; (w * h * 4) as usize];
-        let mask_lines = GetDIBits(
-            hdc,
-            icon_info.hbmMask,
-            0,
-            h as u32,
-            mask_bgra.as_mut_ptr() as *mut c_void,
-            &mut bmi,
-            DIB_RGB_COLORS,
-        );
-        if mask_lines > 0 {
-            for (px, m) in bgra.chunks_exact_mut(4).zip(mask_bgra.chunks_exact(4)) {
-                px[3] = if m[0] == 0 { 255 } else { 0 };
-            }
-        } else {
-            for px in bgra.chunks_exact_mut(4) {
-                px[3] = 255;
-            }
-        }
-    }
-
-    DeleteDC(hdc);
-    cleanup(&icon_info);
-
-    if lines == 0 {
-        return Err("GetDIBits failed".into());
-    }
-
-    encode_rgba_png(w as u32, h as u32, &bgra)
 }
 
 fn read_le_u32(bytes: &[u8], off: usize) -> Option<u32> {
@@ -1376,12 +1119,8 @@ fn process_payload(
 
             let (source_app, source_icon_path) = match source_proc {
                 Some((exe_name, exe_path)) => {
-                    let icon = ensure_app_icon(
-                        &exe_name,
-                        &exe_path,
-                        &state.app_icons_dir,
-                        cached_icons,
-                    );
+                    let icon =
+                        ensure_app_icon(&exe_name, &exe_path, &state.icons_dir, cached_icons);
                     (Some(exe_name), icon)
                 }
                 None => (None, None),
@@ -1436,12 +1175,7 @@ fn save_image_clip(
 
     let (source_app, source_icon_path) = match source_proc {
         Some((exe_name, exe_path)) => {
-            let icon = ensure_app_icon(
-                &exe_name,
-                &exe_path,
-                &state.app_icons_dir,
-                cached_icons,
-            );
+            let icon = ensure_app_icon(&exe_name, &exe_path, &state.icons_dir, cached_icons);
             (Some(exe_name), icon)
         }
         None => (None, None),
@@ -1571,10 +1305,16 @@ fn handle_clipboard_update(hwnd: HWND, ctx: &mut ListenerContext) {
     }
 }
 
-unsafe fn register_popup_hotkey(hwnd: HWND, spec: &str) {
-    UnregisterHotKey(hwnd, HOTKEY_POPUP_ID);
+unsafe fn register_thread_hotkey(app: &AppHandle, spec: &str) {
+    UnregisterHotKey(null_mut(), HOTKEY_POPUP_ID);
+    let state = app.state::<AppState>();
     if let Some((mods, vk)) = parse_hotkey_string(spec) {
-        let _ = RegisterHotKey(hwnd, HOTKEY_POPUP_ID, mods, vk);
+        let ok = RegisterHotKey(null_mut(), HOTKEY_POPUP_ID, mods, vk) != 0;
+        state.hotkey_registered.store(ok, Ordering::SeqCst);
+        let _ = app.emit("klip://hotkey-status", ok);
+    } else {
+        state.hotkey_registered.store(false, Ordering::SeqCst);
+        let _ = app.emit("klip://hotkey-status", false);
     }
 }
 
@@ -1588,20 +1328,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             });
             0
         }
-        WM_HOTKEY => {
-            if wparam as i32 == HOTKEY_POPUP_ID {
-                let fg_hwnd = GetForegroundWindow() as isize;
-                LISTENER_CTX.with(|cell| {
-                    if let Some(ctx) = cell.borrow().as_ref() {
-                        let app_c = ctx.app.clone();
-                        let _ = ctx.app.run_on_main_thread(move || {
-                            toggle_popup_window(&app_c, fg_hwnd);
-                        });
-                    }
-                });
-            }
-            0
-        }
         WM_APP_RELOAD_HOTKEY => {
             LISTENER_CTX.with(|cell| {
                 if let Some(ctx) = cell.borrow().as_ref() {
@@ -1612,13 +1338,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         .ok()
                         .and_then(|conn| db::get_setting(&conn, "hotkey").ok().flatten())
                         .unwrap_or_else(|| "Ctrl+Shift+Backquote".to_string());
-                    register_popup_hotkey(hwnd, &spec);
+                    register_thread_hotkey(&ctx.app, &spec);
                 }
             });
             0
         }
         WM_CLOSE => {
-            UnregisterHotKey(hwnd, HOTKEY_POPUP_ID);
+            UnregisterHotKey(null_mut(), HOTKEY_POPUP_ID);
             RemoveClipboardFormatListener(hwnd);
             DestroyWindow(hwnd);
             0
@@ -1644,9 +1370,15 @@ pub fn start_clipboard_listener(app: AppHandle, initial_hotkey: String) -> Clipb
     thread::Builder::new()
         .name("klip-capture-worker".to_string())
         .spawn(move || {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
             let mut cached_icons: HashMap<String, Option<String>> = HashMap::new();
             while let Ok(payload) = rx.recv() {
                 process_payload(&worker_app, payload, &mut cached_icons);
+            }
+            unsafe {
+                CoUninitialize();
             }
         })
         .expect("Failed to spawn Klip capture worker thread");
@@ -1695,9 +1427,10 @@ pub fn start_clipboard_listener(app: AppHandle, initial_hotkey: String) -> Clipb
                 can_include_history: register_format("CanIncludeInClipboardHistory"),
             };
 
+            let app_for_ctx = app.clone();
             LISTENER_CTX.with(|cell| {
                 *cell.borrow_mut() = Some(ListenerContext {
-                    app,
+                    app: app_for_ctx,
                     formats,
                     worker_tx: Some(tx),
                 });
@@ -1708,10 +1441,19 @@ pub fn start_clipboard_listener(app: AppHandle, initial_hotkey: String) -> Clipb
                 return;
             }
 
-            register_popup_hotkey(hwnd, &initial_hotkey);
+            // Register thread-level hotkey (HWND = NULL -> guaranteed WM_HOTKEY delivery)
+            register_thread_hotkey(&app, &initial_hotkey);
 
             let mut msg = zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                if msg.message == WM_HOTKEY && msg.wParam as i32 == HOTKEY_POPUP_ID {
+                    let fg_hwnd = GetForegroundWindow() as isize;
+                    let app_c = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        toggle_popup_window(&app_c, fg_hwnd);
+                    });
+                    continue;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }

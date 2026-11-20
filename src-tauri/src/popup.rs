@@ -2,6 +2,7 @@ use crate::clipboard::write_clip_to_clipboard;
 use crate::db::{self, ClipItem};
 use crate::{select_window_icon_bytes, AppState};
 use std::mem::{size_of, zeroed};
+use std::ptr::null_mut;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
@@ -11,11 +12,12 @@ use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, IsWindow, SetForegroundWindow,
+    GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow,
 };
 
 pub const HOTKEY_POPUP_ID: i32 = 1;
@@ -119,6 +121,7 @@ pub fn toggle_popup_window(app: &AppHandle, captured_fg_hwnd: isize) {
         .popup_prev_hwnd
         .store(captured_fg_hwnd, Ordering::SeqCst);
     state.popup_keep_open.store(false, Ordering::SeqCst);
+    state.popup_has_focused.store(false, Ordering::SeqCst);
     state
         .popup_opened_at_ms
         .store(db::now_unix_ms(), Ordering::SeqCst);
@@ -200,15 +203,28 @@ pub fn toggle_popup_window(app: &AppHandle, captured_fg_hwnd: isize) {
     let final_y = raw_y.clamp(min_y, max_y);
 
     let _ = win.set_position(PhysicalPosition::new(final_x, final_y));
-    let _ = win.show();
-    let _ = win.set_focus();
+
+    unsafe {
+        let fg = GetForegroundWindow();
+        let fg_tid = if !fg.is_null() {
+            GetWindowThreadProcessId(fg, null_mut())
+        } else {
+            0
+        };
+        let cur_tid = GetCurrentThreadId();
+        let attached = fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(fg_tid, cur_tid, 1) != 0;
+        let _ = win.show();
+        let _ = win.set_focus();
+        if attached {
+            AttachThreadInput(fg_tid, cur_tid, 0);
+        }
+    }
 }
 
 fn send_ctrl_v() {
     unsafe {
         let mut list: Vec<INPUT> = Vec::with_capacity(8);
 
-        // Release Shift / Alt if still held (e.g. Shift+Enter plain paste)
         if GetAsyncKeyState(0x10) < 0 {
             let mut up: INPUT = zeroed();
             up.r#type = INPUT_KEYBOARD;
@@ -235,10 +251,10 @@ fn send_ctrl_v() {
         }
 
         let keys = [
-            (0x11u16, 0u32),               // Ctrl down
-            (0x56u16, 0u32),               // V down
-            (0x56u16, KEYEVENTF_KEYUP),    // V up
-            (0x11u16, KEYEVENTF_KEYUP),    // Ctrl up
+            (0x11u16, 0u32),
+            (0x56u16, 0u32),
+            (0x56u16, KEYEVENTF_KEYUP),
+            (0x11u16, KEYEVENTF_KEYUP),
         ];
 
         for (vk, flags) in keys {
@@ -274,7 +290,6 @@ pub fn paste_clip_to_previous_window(
             .unwrap_or_else(|| "auto_paste".to_string())
     };
 
-    // Hand off foreground focus WHILE Klip popup still holds foreground privilege
     if paste_mode == "auto_paste" && prev_hwnd != 0 {
         unsafe {
             let target = prev_hwnd as HWND;
