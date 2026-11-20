@@ -2,11 +2,13 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct StoragePaths {
     pub app_dir: PathBuf,
     pub db_path: PathBuf,
     pub images_dir: PathBuf,
+    pub app_icons_dir: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -15,21 +17,57 @@ pub struct SettingEntry {
     pub value: String,
 }
 
+#[derive(Clone, Serialize)]
+pub struct ClipItem {
+    pub id: i64,
+    pub clip_type: String,
+    pub text_content: Option<String>,
+    pub html_content: Option<String>,
+    pub image_path: Option<String>,
+    pub content_size: i64,
+    pub source_app: Option<String>,
+    pub source_icon_path: Option<String>,
+    pub is_pinned: bool,
+    pub created_at: i64,
+}
+
+pub struct NewClip<'a> {
+    pub clip_type: &'a str,
+    pub text_content: Option<&'a str>,
+    pub html_content: Option<&'a str>,
+    pub image_path: Option<&'a str>,
+    pub content_size: i64,
+    pub source_app: Option<&'a str>,
+    pub source_icon_path: Option<&'a str>,
+    pub created_at: i64,
+}
+
+pub fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub fn resolve_storage_paths() -> Result<StoragePaths, String> {
     let base_data = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| "Unable to locate Windows APPDATA directory".to_string())?;
     let app_dir = base_data.join("Klip");
     let images_dir = app_dir.join("images");
+    let app_icons_dir = app_dir.join("app_icons");
     let db_path = app_dir.join("klip.db");
 
     fs::create_dir_all(&app_dir).map_err(|e| format!("Failed creating Klip dir: {e}"))?;
     fs::create_dir_all(&images_dir).map_err(|e| format!("Failed creating images dir: {e}"))?;
+    fs::create_dir_all(&app_icons_dir)
+        .map_err(|e| format!("Failed creating app_icons dir: {e}"))?;
 
     Ok(StoragePaths {
         app_dir,
         db_path,
         images_dir,
+        app_icons_dir,
     })
 }
 
@@ -190,4 +228,267 @@ pub fn list_tables(conn: &Connection) -> Result<Vec<String>, String> {
         tables.push(item.map_err(|e| format!("Failed reading table name: {e}"))?);
     }
     Ok(tables)
+}
+
+pub fn insert_clip(conn: &Connection, clip: &NewClip<'_>) -> Result<ClipItem, String> {
+    conn.execute(
+        "INSERT INTO clips (
+            clip_type, text_content, html_content, image_path,
+            content_size, source_app, source_icon_path, is_pinned, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+        params![
+            clip.clip_type,
+            clip.text_content,
+            clip.html_content,
+            clip.image_path,
+            clip.content_size,
+            clip.source_app,
+            clip.source_icon_path,
+            clip.created_at
+        ],
+    )
+    .map_err(|e| format!("Failed inserting clip: {e}"))?;
+
+    let id = conn.last_insert_rowid();
+    Ok(ClipItem {
+        id,
+        clip_type: clip.clip_type.to_string(),
+        text_content: clip.text_content.map(|s| s.to_string()),
+        html_content: clip.html_content.map(|s| s.to_string()),
+        image_path: clip.image_path.map(|s| s.to_string()),
+        content_size: clip.content_size,
+        source_app: clip.source_app.map(|s| s.to_string()),
+        source_icon_path: clip.source_icon_path.map(|s| s.to_string()),
+        is_pinned: false,
+        created_at: clip.created_at,
+    })
+}
+
+fn escape_like_pattern(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 4);
+    for ch in input.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+pub fn list_clips(
+    conn: &Connection,
+    search: Option<&str>,
+    pinned_only: bool,
+    limit: i64,
+) -> Result<Vec<ClipItem>, String> {
+    let q = search.unwrap_or("").trim();
+    let has_search = !q.is_empty();
+    let like_pattern = format!("%{}%", escape_like_pattern(q));
+
+    let sql = match (pinned_only, has_search) {
+        (true, true) => {
+            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
+                    source_app, source_icon_path, is_pinned, created_at
+             FROM clips
+             WHERE is_pinned = 1
+               AND (text_content LIKE ?1 ESCAPE '\\' OR source_app LIKE ?1 ESCAPE '\\' OR clip_type LIKE ?1 ESCAPE '\\')
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2"
+        }
+        (true, false) => {
+            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
+                    source_app, source_icon_path, is_pinned, created_at
+             FROM clips
+             WHERE is_pinned = 1
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1"
+        }
+        (false, true) => {
+            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
+                    source_app, source_icon_path, is_pinned, created_at
+             FROM clips
+             WHERE (text_content LIKE ?1 ESCAPE '\\' OR source_app LIKE ?1 ESCAPE '\\' OR clip_type LIKE ?1 ESCAPE '\\')
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2"
+        }
+        (false, false) => {
+            "SELECT id, clip_type, text_content, html_content, image_path, content_size,
+                    source_app, source_icon_path, is_pinned, created_at
+             FROM clips
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1"
+        }
+    };
+
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("Failed preparing list_clips: {e}"))?;
+
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ClipItem> {
+        Ok(ClipItem {
+            id: row.get(0)?,
+            clip_type: row.get(1)?,
+            text_content: row.get(2)?,
+            html_content: row.get(3)?,
+            image_path: row.get(4)?,
+            content_size: row.get(5)?,
+            source_app: row.get(6)?,
+            source_icon_path: row.get(7)?,
+            is_pinned: row.get::<_, i64>(8)? != 0,
+            created_at: row.get(9)?,
+        })
+    };
+
+    let mut items = Vec::new();
+    if has_search {
+        let rows = stmt
+            .query_map(params![like_pattern, limit], map_row)
+            .map_err(|e| format!("Failed querying clips: {e}"))?;
+        for r in rows {
+            items.push(r.map_err(|e| format!("Failed reading clip row: {e}"))?);
+        }
+    } else {
+        let rows = stmt
+            .query_map(params![limit], map_row)
+            .map_err(|e| format!("Failed querying clips: {e}"))?;
+        for r in rows {
+            items.push(r.map_err(|e| format!("Failed reading clip row: {e}"))?);
+        }
+    }
+
+    Ok(items)
+}
+
+pub fn toggle_pin(conn: &Connection, clip_id: i64) -> Result<bool, String> {
+    conn.execute(
+        "UPDATE clips SET is_pinned = CASE WHEN is_pinned = 0 THEN 1 ELSE 0 END WHERE id = ?1",
+        params![clip_id],
+    )
+    .map_err(|e| format!("Failed toggling pin: {e}"))?;
+
+    let mut stmt = conn
+        .prepare("SELECT is_pinned FROM clips WHERE id = ?1")
+        .map_err(|e| format!("Failed reading pin state: {e}"))?;
+    let pinned: i64 = stmt
+        .query_row(params![clip_id], |r| r.get(0))
+        .map_err(|e| format!("Clip not found after pin toggle: {e}"))?;
+    Ok(pinned != 0)
+}
+
+pub fn delete_clip(conn: &Connection, clip_id: i64) -> Result<(), String> {
+    let img_path: Option<String> = {
+        let mut stmt = conn
+            .prepare("SELECT image_path FROM clips WHERE id = ?1")
+            .map_err(|e| format!("Failed preparing delete lookup: {e}"))?;
+        let mut rows = stmt
+            .query(params![clip_id])
+            .map_err(|e| format!("Failed querying delete lookup: {e}"))?;
+        if let Some(row) = rows
+            .next()
+            .map_err(|e| format!("Failed reading delete lookup: {e}"))?
+        {
+            row.get(0).ok()
+        } else {
+            None
+        }
+    };
+
+    conn.execute("DELETE FROM clips WHERE id = ?1", params![clip_id])
+        .map_err(|e| format!("Failed deleting clip: {e}"))?;
+
+    if let Some(path) = img_path {
+        if !path.is_empty() {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn enforce_retention_and_limits(conn: &Connection) -> Result<Vec<i64>, String> {
+    let mut removed_ids = Vec::new();
+    let now_ms = now_unix_ms();
+
+    // 1. Retention days (never purge pinned clips)
+    let retention_raw = get_setting(conn, "retention_days")?.unwrap_or_else(|| "30".to_string());
+    if retention_raw != "all" {
+        if let Ok(days) = retention_raw.parse::<i64>() {
+            if days > 0 {
+                let cutoff = now_ms - days * 86_400_000;
+                let mut stmt = conn
+                    .prepare("SELECT id, image_path FROM clips WHERE is_pinned = 0 AND created_at < ?1")
+                    .map_err(|e| format!("Failed querying expired clips: {e}"))?;
+                let rows = stmt
+                    .query_map(params![cutoff], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+                    })
+                    .map_err(|e| format!("Failed reading expired clips: {e}"))?;
+
+                let mut to_remove = Vec::new();
+                for row in rows.flatten() {
+                    to_remove.push(row);
+                }
+                drop(stmt);
+
+                for (id, img) in to_remove {
+                    conn.execute("DELETE FROM clips WHERE id = ?1", params![id])
+                        .map_err(|e| format!("Failed pruning expired clip {id}: {e}"))?;
+                    if let Some(p) = img {
+                        let _ = fs::remove_file(p);
+                    }
+                    removed_ids.push(id);
+                }
+            }
+        }
+    }
+
+    // 2. Collection limit (never purge pinned clips)
+    let limit_raw = get_setting(conn, "collection_limit")?.unwrap_or_else(|| "1000".to_string());
+    if limit_raw != "unlimited" {
+        if let Ok(limit) = limit_raw.parse::<i64>() {
+            if limit > 0 {
+                let total: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+                    .map_err(|e| format!("Failed counting clips: {e}"))?;
+
+                if total > limit {
+                    let excess = total - limit;
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, image_path FROM clips
+                             WHERE is_pinned = 0
+                             ORDER BY created_at ASC, id ASC
+                             LIMIT ?1",
+                        )
+                        .map_err(|e| format!("Failed querying excess clips: {e}"))?;
+
+                    let rows = stmt
+                        .query_map(params![excess], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+                        })
+                        .map_err(|e| format!("Failed reading excess clips: {e}"))?;
+
+                    let mut to_remove = Vec::new();
+                    for row in rows.flatten() {
+                        to_remove.push(row);
+                    }
+                    drop(stmt);
+
+                    for (id, img) in to_remove {
+                        conn.execute("DELETE FROM clips WHERE id = ?1", params![id])
+                            .map_err(|e| format!("Failed trimming clip {id}: {e}"))?;
+                        if let Some(p) = img {
+                            let _ = fs::remove_file(p);
+                        }
+                        removed_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(removed_ids)
 }

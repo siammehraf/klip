@@ -1,6 +1,8 @@
+mod clipboard;
 mod db;
 
-use db::SettingEntry;
+use clipboard::ClipboardWatcherHandle;
+use db::{ClipItem, SettingEntry};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -29,10 +31,12 @@ pub struct AppState {
     pub conn: Mutex<Connection>,
     pub db_path: PathBuf,
     pub images_dir: PathBuf,
+    pub app_icons_dir: PathBuf,
     pub paused: Mutex<bool>,
     pub theme: Mutex<String>,
     pub pause_menu_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     pub allow_exit: AtomicBool,
+    pub watcher: Mutex<Option<ClipboardWatcherHandle>>,
 }
 
 #[derive(Serialize)]
@@ -103,7 +107,7 @@ fn open_or_focus_main_window(app: &AppHandle) {
 
     if let Ok(win) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Klip")
-        .inner_size(960.0, 660.0)
+        .inner_size(1020.0, 680.0)
         .min_inner_size(720.0, 480.0)
         .center()
         .resizable(true)
@@ -157,7 +161,6 @@ fn clean_font_registry_name(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    // Strip format tags such as " (TrueType)", " (OpenType)", " (All res)"
     let base = match trimmed.find(" (") {
         Some(idx) => &trimmed[..idx],
         None => trimmed,
@@ -285,10 +288,59 @@ fn set_font_family(state: State<'_, AppState>, font_family: String) -> Result<()
     db::set_setting(&conn, "font_family", font_family.trim())
 }
 
+#[tauri::command]
+fn list_clips(
+    state: State<'_, AppState>,
+    search: Option<String>,
+    pinned_only: Option<bool>,
+    limit: Option<i64>,
+) -> Result<Vec<ClipItem>, String> {
+    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    db::list_clips(
+        &conn,
+        search.as_deref(),
+        pinned_only.unwrap_or(false),
+        limit.unwrap_or(200),
+    )
+}
+
+#[tauri::command]
+fn toggle_pin_clip(state: State<'_, AppState>, clip_id: i64) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    db::toggle_pin(&conn, clip_id)
+}
+
+#[tauri::command]
+fn delete_clip(state: State<'_, AppState>, clip_id: i64) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    db::delete_clip(&conn, clip_id)
+}
+
+#[tauri::command]
+fn get_excluded_apps(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    let raw = db::get_setting(&conn, "excluded_apps")?.unwrap_or_else(|| "[]".to_string());
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+#[tauri::command]
+fn set_excluded_apps(state: State<'_, AppState>, apps: Vec<String>) -> Result<Vec<String>, String> {
+    let cleaned: Vec<String> = apps
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let json = serde_json::to_string(&cleaned).map_err(|e| format!("JSON error: {e}"))?;
+    let conn = state.conn.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    db::set_setting(&conn, "excluded_apps", &json)?;
+    Ok(cleaned)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let storage = db::resolve_storage_paths().expect("Failed to resolve Klip storage paths");
     let conn = db::open_and_init(&storage.db_path).expect("Failed to initialize Klip SQLite DB");
+    let _ = db::enforce_retention_and_limits(&conn);
 
     let initial_paused = db::get_setting(&conn, "paused")
         .ok()
@@ -299,7 +351,13 @@ pub fn run() {
     let initial_theme = db::get_setting(&conn, "theme")
         .ok()
         .flatten()
-        .map(|v| if v == "light" { "light".to_string() } else { "dark".to_string() })
+        .map(|v| {
+            if v == "light" {
+                "light".to_string()
+            } else {
+                "dark".to_string()
+            }
+        })
         .unwrap_or_else(|| "dark".to_string());
 
     let initial_autostart_set = db::get_setting(&conn, "autostart_initialized")
@@ -310,11 +368,13 @@ pub fn run() {
     let app_state = AppState {
         conn: Mutex::new(conn),
         db_path: storage.db_path,
-        images_dir: storage.images_dir,
+        images_dir: storage.images_dir.clone(),
+        app_icons_dir: storage.app_icons_dir.clone(),
         paused: Mutex::new(initial_paused),
         theme: Mutex::new(initial_theme.clone()),
         pause_menu_item: Mutex::new(None),
         allow_exit: AtomicBool::new(false),
+        watcher: Mutex::new(None),
     };
 
     let app = tauri::Builder::default()
@@ -331,9 +391,19 @@ pub fn run() {
             toggle_pause,
             set_theme,
             set_font_family,
-            list_installed_fonts
+            list_installed_fonts,
+            list_clips,
+            toggle_pin_clip,
+            delete_clip,
+            get_excluded_apps,
+            set_excluded_apps
         ])
         .setup(move |app| {
+            // Allow asset:// reads strictly for Klip images & cached app icons
+            let scope = app.asset_protocol_scope();
+            let _ = scope.allow_directory(&storage.images_dir, true);
+            let _ = scope.allow_directory(&storage.app_icons_dir, true);
+
             if !initial_autostart_set {
                 let _ = app.autolaunch().enable();
                 let state = app.state::<AppState>();
@@ -361,7 +431,8 @@ pub fn run() {
 
             let menu = Menu::with_items(app, &[&open_item, &pause_item, &sep, &quit_item])?;
 
-            let tray_icon = Image::from_bytes(select_tray_icon_bytes(&initial_theme, initial_paused))?;
+            let tray_icon =
+                Image::from_bytes(select_tray_icon_bytes(&initial_theme, initial_paused))?;
             let tooltip = if initial_paused {
                 "Klip \u{2014} Saving Paused"
             } else {
@@ -382,6 +453,11 @@ pub fn run() {
                     }
                     "quit" => {
                         let state = app.state::<AppState>();
+                        if let Ok(mut w) = state.watcher.lock() {
+                            if let Some(handle) = w.take() {
+                                handle.stop();
+                            }
+                        };
                         state.allow_exit.store(true, Ordering::SeqCst);
                         app.exit(0);
                     }
@@ -398,6 +474,15 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // Start native Win32 AddClipboardFormatListener thread
+            let handle = clipboard::start_clipboard_listener(app.handle().clone());
+            {
+                let state = app.state::<AppState>();
+                if let Ok(mut guard) = state.watcher.lock() {
+                    *guard = Some(handle);
+                };
+            }
 
             Ok(())
         })
