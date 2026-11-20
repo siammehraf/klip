@@ -414,7 +414,7 @@ pub fn ensure_app_icon(
     };
 
     let result = match png_opt {
-        Some(bytes) if fs::write(&dest_path, bytes).is_ok() => Some(dest_str),
+        Some(ref bytes) if fs::write(&dest_path, bytes).is_ok() => Some(dest_str),
         _ => None,
     };
 
